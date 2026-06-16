@@ -29,6 +29,9 @@ pub struct MusicPlayerApp {
     eq_settings: EqSettings,
     waveform_params: WaveformParams,
     pending_load: Option<Receiver<LoadOutcome>>,
+    /// File-open requests forwarded from secondary launches (double-click in
+    /// Explorer). `None` when single-instance IPC isn't wired up.
+    file_rx: Option<Receiver<PathBuf>>,
     /// Live spectrum strip (`None` when no audio device is available).
     spectrum: Option<SpectrumAnalyzer>,
     spectrum_params: SpectrumParams,
@@ -100,7 +103,11 @@ struct LoadedData {
 }
 
 impl MusicPlayerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial_file: Option<PathBuf>,
+        file_rx: Option<Receiver<PathBuf>>,
+    ) -> Self {
         configure_style(&cc.egui_ctx);
         let audio = AudioEngine::new().map_err(|error| error.to_string());
         let eq_settings = audio
@@ -120,6 +127,7 @@ impl MusicPlayerApp {
             eq_settings,
             waveform_params: WaveformParams::default(),
             pending_load: None,
+            file_rx,
             spectrum,
             spectrum_params: SpectrumParams::default(),
             clip_meter: ClipMeter::default(),
@@ -197,6 +205,27 @@ impl MusicPlayerApp {
         }
     }
 
+    /// Load a file forwarded from a secondary launch (double-click in Explorer)
+    /// and pop the window to the front, like a typical media player. Only the most
+    /// recent request matters if several arrive in one frame.
+    fn poll_file_requests(&mut self, ctx: &Context) {
+        let latest = match &self.file_rx {
+            Some(rx) => {
+                let mut latest = None;
+                while let Ok(path) = rx.try_recv() {
+                    latest = Some(path);
+                }
+                latest
+            }
+            None => None,
+        };
+        if let Some(path) = latest {
+            self.load_path(path);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
     fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Open audio file")
@@ -232,6 +261,7 @@ impl eframe::App for MusicPlayerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
+        self.poll_file_requests(&ctx);
         self.poll_load(&ctx);
         let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 0.1);
         self.update_visualizers(dt);

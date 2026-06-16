@@ -273,18 +273,14 @@ impl PlaybackState {
         self.volume = volume.clamp(0.0, 1.0);
     }
 
-    /// Linear amplitude gain for the current fader position.
+    /// Amplitude gain for the current fader position.
     ///
-    /// Loudness perception is roughly logarithmic, so a linear fader feels like
-    /// nothing happens until the very top. Map the 0..=1 fader through a ~60 dB
-    /// exponential taper instead, so equal slider movement is roughly equal
-    /// perceived loudness change. Fader 1.0 == unity (0 dB); 0.0 == silence.
+    /// A straight linear map (fader == amplitude). An earlier log/exponential
+    /// taper was "correct" perceptually but made the bottom half of the slider
+    /// nearly silent (≈ −36 dB at 40%), so it's gone. Fader 1.0 == unity; 0.0 ==
+    /// silence.
     pub fn gain(&self) -> f32 {
-        if self.volume <= 0.0 {
-            0.0
-        } else {
-            10f32.powf((self.volume - 1.0) * 3.0)
-        }
+        self.volume.clamp(0.0, 1.0)
     }
 
     pub fn track(&self) -> Option<Arc<PlaybackBuffer>> {

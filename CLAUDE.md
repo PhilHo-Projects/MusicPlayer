@@ -60,7 +60,8 @@ Always confirm an API against the crate source in
   sections), central album art.
 - `audio.rs` — `AudioEngine` (cpal stream + `Arc<Mutex<EngineShared>>`),
   `PlaybackState`, `EqProcessor` (biquad peaking, `EQ_BANDS_HZ`), channel remix
-  and `rubato` resampling. Volume gain is a log taper in `PlaybackState::gain`.
+  and `rubato` resampling. Volume gain is linear (`PlaybackState::gain`); an
+  earlier log taper was reverted because it made the bottom half nearly silent.
   `VizTap` captures the final mono mix + pre-clamp peak/clip for the visualizers;
   the UI drains it via `AudioEngine::drain_viz`.
 - `spectrum.rs` — `SpectrumAnalyzer`: one `realfft` pass per frame over the tapped
@@ -68,6 +69,9 @@ Always confirm an API against the crate source in
 - `decoder.rs` — `decode_track` → `DecodedTrack { samples, …, waveform }`.
 - `metadata.rs` — `read_track_info` via `lofty`; BPM/key/Traktor fields.
 - `waveform.rs` — analysis + render params (see below).
+- `single_instance.rs` — loopback-socket guard: a second launch (double-clicking
+  a file) forwards its path to the running window and exits, rather than opening a
+  new window. `main.rs` calls `acquire`/`serve`; the UI polls the receiver.
 
 ## Key facts (verified against the fixture)
 
