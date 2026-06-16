@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target
+
+# Packaged release builds (distribute via GitHub Releases / CI, not the repo)
+/dist
+
+# Local audio test fixtures (copyrighted — kept out of version control)
+/Example
+
+# Personal dev journal (not shared)
+/timeline.md
+
+# OS / editor cruft
+Thumbs.db
+.DS_Store
+*.swp
+.vscode/
+.idea/

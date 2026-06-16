@@ -1,0 +1,30 @@
+[package]
+name = "music_player"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+biquad = "0.6.0"
+cpal = "0.18.1"
+eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+image = { version = "0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+lofty = "0.24.0"
+realfft = "3.5.0"
+rfd = "0.17.2"
+rubato = "3.0.0"
+symphonia = { version = "0.6.0", default-features = false, features = ["aac", "alac", "flac", "isomp4", "mp3", "pcm", "wav"] }
+thiserror = "2.0.17"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# Keep loading fast in debug builds. The DSP work (symphonia decode, rubato's
+# generic FFT resampler) is unusably slow when unoptimized, which made loading a
+# track take ~10s under `cargo run`. opt-level = 1 on the app crate covers the
+# generic resampler code that gets monomorphized here; opt-level = 3 on deps
+# covers everything else. Debug info is preserved, so the app stays debuggable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
