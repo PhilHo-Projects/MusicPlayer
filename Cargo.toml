@@ -1,6 +1,6 @@
 [package]
 name = "music_player"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -12,11 +12,19 @@ lofty = "0.24.0"
 realfft = "3.5.0"
 rfd = "0.17.2"
 rubato = "3.0.0"
-symphonia = { version = "0.6.0", default-features = false, features = ["aac", "alac", "flac", "isomp4", "mp3", "pcm", "wav"] }
+# `id3v1`/`id3v2` aren't for metadata (lofty reads that) — they register the tag
+# readers with symphonia's *probe* so it skips a leading ID3 tag instead of
+# scanning into it. Without them, files with embedded art (a JPEG full of 0xFF
+# bytes) make the MP3 demuxer lock onto a false frame sync inside the tag and
+# decode dies with "unsupported audio codec". See decoder.rs.
+symphonia = { version = "0.6.0", default-features = false, features = ["aac", "alac", "flac", "id3v1", "id3v2", "isomp4", "mp3", "pcm", "wav"] }
 thiserror = "2.0.17"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[build-dependencies]
+winresource = "0.1.31"
 
 # Keep loading fast in debug builds. The DSP work (symphonia decode, rubato's
 # generic FFT resampler) is unusably slow when unoptimized, which made loading a

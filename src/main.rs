@@ -2,6 +2,7 @@
 
 use eframe::egui;
 use music_player::app::{MusicPlayerApp, initial_file_from_args};
+use music_player::icon::app_icon;
 use music_player::single_instance::{self, Startup};
 
 fn main() -> eframe::Result<()> {
@@ -17,7 +18,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([720.0, 520.0]),
+            .with_min_inner_size([720.0, 520.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
 

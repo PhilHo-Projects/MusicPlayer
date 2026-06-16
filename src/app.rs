@@ -305,9 +305,12 @@ impl eframe::App for MusicPlayerApp {
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(18, 18, 18)))
             .show_inside(ui, |ui| self.show_inspector(ui));
 
+        // The panel's own fill is the strip background, so the dark reaches every
+        // edge (no lighter frame peeking out the sides). Bars sit in a slightly
+        // inset area within it.
         egui::Panel::bottom("spectrum")
-            .exact_size(44.0)
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(22, 22, 22)))
+            .exact_size(68.0)
+            .frame(egui::Frame::NONE.fill(Color32::from_rgb(14, 14, 14)))
             .show_inside(ui, |ui| {
                 let strip = ui.max_rect().shrink2(Vec2::new(6.0, 5.0));
                 let params = self.spectrum_params;
@@ -656,7 +659,8 @@ impl MusicPlayerApp {
     }
 
     fn paint_spectrum(&self, painter: &egui::Painter, rect: Rect, params: SpectrumParams) {
-        painter.rect_filled(rect, 3.0, Color32::from_rgb(14, 14, 14));
+        // Background comes from the panel fill (full width); `rect` is the inset
+        // area the bars draw into.
         let Some(spectrum) = &self.spectrum else {
             return;
         };
@@ -670,17 +674,18 @@ impl MusicPlayerApp {
         let baseline = rect.bottom() - 1.0;
         let usable = (rect.height() - 2.0).max(1.0);
 
-        // Downsample the analyzer's n bars to dn display columns.
-        // Taking the loudest bin in the bucket keeps transient energy visible.
-        let sb = |d: usize, dn: usize| bars[(d * n / dn).min(n - 1)];
-        let sp = |d: usize, dn: usize| peaks[(d * n / dn).min(n - 1)];
+        // Downsample the analyzer's n bars to dn display columns by taking the
+        // loudest bar in each bucket — keeps transient energy visible. dn <= n
+        // always (clamped below), so a bucket is never empty.
+        let sb = |d: usize, dn: usize| bucket_max(bars, d, dn);
+        let sp = |d: usize, dn: usize| bucket_max(peaks, d, dn);
 
-        // Minimum pixel width per display column — drives the proportional bar
-        // count so bars don't become fat on large windows.
-        let min_px: f32 = match params.mode {
-            SpectrumDisplayMode::Bars => 3.0,
-            SpectrumDisplayMode::Line => 2.5,
-        };
+        // Target on-screen pitch per column, in points. The column count is
+        // width / pitch (capped at BAR_COUNT), so bars keep a *constant* width as
+        // the window grows and only multiply — the fat bars on fullscreen were
+        // just 64 bars stretched to fill. ~5 pt reproduces the default-window
+        // density; columns only have to widen again past ~a fullscreen window.
+        let min_px: f32 = 5.0;
 
         if params.symmetric {
             // Center = lowest freq, edges = highest. Both halves mirror each other.
@@ -1261,6 +1266,15 @@ fn play_pause_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
         painter.add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
     }
     response
+}
+
+/// Loudest of the analyzer bars feeding display column `d` of `dn` total — a
+/// max-pooled downsample. `dn <= arr.len()`, so the bucket always spans >=1 bar.
+fn bucket_max(arr: &[f32], d: usize, dn: usize) -> f32 {
+    let n = arr.len();
+    let lo = d * n / dn;
+    let hi = ((d + 1) * n / dn).clamp(lo + 1, n);
+    arr[lo..hi].iter().copied().fold(0.0, f32::max)
 }
 
 fn level_color(t: f32) -> Color32 {

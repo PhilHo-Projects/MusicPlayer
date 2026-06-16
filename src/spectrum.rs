@@ -14,8 +14,11 @@ use realfft::{RealFftPlanner, RealToComplex, num_complex::Complex};
 /// audio tap retains a ring at least this long so a full window is always ready.
 pub const FFT_SIZE: usize = 2048;
 
-/// Number of drawn bars, log-spaced across the audible range.
-pub const BAR_COUNT: usize = 64;
+/// Analyzer resolution: log-spaced frequency bars. The strip downsamples these to
+/// however many columns fit at a fixed on-screen pitch, so a wider/fullscreen
+/// window shows *more* bars rather than fatter ones. Sized so we don't run out of
+/// bars until well past a fullscreen window on a typical monitor.
+pub const BAR_COUNT: usize = 192;
 
 // Magnitudes are converted to dB and mapped from this window onto 0..=1. Tuned by
 // eye so typical music fills the strip without the noise floor lighting it up.
