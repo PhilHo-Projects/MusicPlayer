@@ -102,6 +102,24 @@ struct LoadedData {
     buffer: Option<PlaybackBuffer>,
 }
 
+/// Cosmetic render settings persisted between sessions via eframe's storage
+/// (a small RON file in the OS app-data dir). Deliberately scoped to the
+/// spectrum/waveform draw params — not audio, EQ, or window geometry.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PersistedSettings {
+    waveform: WaveformParams,
+    spectrum: SpectrumParams,
+}
+
+impl PersistedSettings {
+    /// Load from storage, or defaults if nothing's saved yet / the record is
+    /// unreadable. `#[serde(default)]` on the param structs keeps a partial or
+    /// outdated record usable instead of discarding the whole thing.
+    fn load(storage: &dyn eframe::Storage) -> Self {
+        eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
+    }
+}
+
 impl MusicPlayerApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -119,17 +137,21 @@ impl MusicPlayerApp {
             .ok()
             .map(|engine| SpectrumAnalyzer::new(engine.output_sample_rate()));
 
+        // Restore the spectrum/waveform render settings from the last session.
+        // Missing or unreadable storage (fresh install) falls back to defaults.
+        let settings = cc.storage.map(PersistedSettings::load).unwrap_or_default();
+
         let mut app = Self {
             audio,
             track: None,
             cover_texture: None,
             status: "Open or drop one audio file.".to_owned(),
             eq_settings,
-            waveform_params: WaveformParams::default(),
+            waveform_params: settings.waveform,
             pending_load: None,
             file_rx,
             spectrum,
-            spectrum_params: SpectrumParams::default(),
+            spectrum_params: settings.spectrum,
             clip_meter: ClipMeter::default(),
             viz_samples: Vec::with_capacity(crate::spectrum::FFT_SIZE),
         };
@@ -322,6 +344,24 @@ impl eframe::App for MusicPlayerApp {
             .show_inside(ui, |ui| self.show_album_area(ui));
 
         ctx.request_repaint_after(Duration::from_millis(33));
+    }
+
+    /// Persist the cosmetic render settings. eframe calls this on shutdown and
+    /// every `auto_save_interval`, so a Reset that's left in place is saved too —
+    /// the next launch then opens with those defaults, exactly as left.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let settings = PersistedSettings {
+            waveform: self.waveform_params,
+            spectrum: self.spectrum_params,
+        };
+        eframe::set_value(storage, eframe::APP_KEY, &settings);
+    }
+
+    /// We save our own settings explicitly above; don't also persist egui's
+    /// memory (panel widths, which sections are open). Keeps cross-session state
+    /// limited to what the Spectrum/Waveform panels actually tweak.
+    fn persist_egui_memory(&self) -> bool {
+        false
     }
 }
 
@@ -717,7 +757,8 @@ impl MusicPlayerApp {
                                 level_color(lv),
                             );
                         }
-                        if params.peak_caps {
+                        // Peak caps are a Bars-only flourish (the Line style omits them).
+                        {
                             let cy = baseline - sp(li, half_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(lx, cy), Pos2::new(lx + bw, cy)],
@@ -740,7 +781,7 @@ impl MusicPlayerApp {
                                 level_color(rv),
                             );
                         }
-                        if params.peak_caps {
+                        {
                             let cy = baseline - sp(d, half_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(rx, cy), Pos2::new(rx + bw, cy)],
@@ -796,26 +837,6 @@ impl MusicPlayerApp {
                         ridge,
                         Stroke::new(1.5, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
                     ));
-
-                    if params.peak_caps {
-                        for d in 0..half_n {
-                            let lx = rect.left() + (d as f32 + 0.5) * slot;
-                            let lcy =
-                                baseline - sp(half_n - 1 - d, half_n).clamp(0.0, 1.0) * usable;
-                            painter.circle_filled(
-                                Pos2::new(lx, lcy),
-                                1.5,
-                                Color32::from_rgba_unmultiplied(235, 235, 235, 160),
-                            );
-                            let rx = cx + (d as f32 + 0.5) * slot;
-                            let rcy = baseline - sp(d, half_n).clamp(0.0, 1.0) * usable;
-                            painter.circle_filled(
-                                Pos2::new(rx, rcy),
-                                1.5,
-                                Color32::from_rgba_unmultiplied(235, 235, 235, 160),
-                            );
-                        }
-                    }
                 }
             }
         } else {
@@ -843,7 +864,8 @@ impl MusicPlayerApp {
                                 level_color(v),
                             );
                         }
-                        if params.peak_caps {
+                        // Peak caps are a Bars-only flourish (the Line style omits them).
+                        {
                             let cy = baseline - sp(i, display_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(x, cy), Pos2::new(x + bw, cy)],
@@ -880,18 +902,6 @@ impl MusicPlayerApp {
                         pts,
                         Stroke::new(1.5, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
                     ));
-
-                    if params.peak_caps {
-                        for i in 0..display_n {
-                            let x = rect.left() + (i as f32 + 0.5) * slot;
-                            let cy = baseline - sp(i, display_n).clamp(0.0, 1.0) * usable;
-                            painter.circle_filled(
-                                Pos2::new(x, cy),
-                                1.5,
-                                Color32::from_rgba_unmultiplied(235, 235, 235, 160),
-                            );
-                        }
-                    }
                 }
             }
         }
@@ -1031,7 +1041,6 @@ impl MusicPlayerApp {
         }
 
         ui.add(egui::Slider::new(&mut p.sensitivity, 0.25..=3.0).text("Sensitivity"));
-        ui.checkbox(&mut p.peak_caps, "Peak caps");
         ui.checkbox(&mut p.symmetric, "Symmetric (center = bass)");
 
         ui.add_space(4.0);

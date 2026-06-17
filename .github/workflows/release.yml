@@ -1,8 +1,9 @@
 name: Release
 
 # Tag a commit `vX.Y.Z` (matching the version in Cargo.toml) and push the tag to
-# build the standalone exe and attach the zip to a GitHub Release. Can also be run
-# manually (artifact only, no Release) via the Actions tab.
+# build the standalone Windows exe and a universal macOS .app, then attach both to
+# a GitHub Release. Can also be run manually (artifacts only, no Release) from the
+# Actions tab.
 on:
   push:
     tags: ['v*']
@@ -12,10 +13,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  package:
+  windows:
     runs-on: windows-latest
-    permissions:
-      contents: write # needed to create the Release
     steps:
       - uses: actions/checkout@v4
 
@@ -38,9 +37,98 @@ jobs:
           path: dist/MusicPlayer-*.zip
           if-no-files-found: error
 
-      - name: Attach zip to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (universal targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Build both arches, lipo them into one universal binary, and wrap it in a
+      # double-clickable .app. Unsigned / un-notarized: a first launch needs a
+      # right-click -> Open (or `xattr -dr com.apple.quarantine MusicPlayer.app`).
+      - name: Build universal .app
+        shell: bash
+        run: |
+          set -euo pipefail
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "Building MusicPlayer $VERSION (universal)"
+
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+          APP="MusicPlayer.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          lipo -create -output "$APP/Contents/MacOS/MusicPlayer" \
+            target/aarch64-apple-darwin/release/music_player \
+            target/x86_64-apple-darwin/release/music_player
+          chmod +x "$APP/Contents/MacOS/MusicPlayer"
+
+          # Finder/Dock icon: build an .icns from the bundled PNG.
+          ICONSET="icon.iconset"
+          mkdir -p "$ICONSET"
+          gen() { sips -z "$2" "$2" assets/icon.png --out "$ICONSET/icon_$1.png" >/dev/null; }
+          gen 16x16 16;    gen 16x16@2x 32
+          gen 32x32 32;    gen 32x32@2x 64
+          gen 128x128 128; gen 128x128@2x 256
+          gen 256x256 256; gen 256x256@2x 512
+          gen 512x512 512; gen 512x512@2x 1024
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns"
+
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0">' \
+            '<dict>' \
+            '  <key>CFBundleName</key><string>MusicPlayer</string>' \
+            '  <key>CFBundleDisplayName</key><string>MusicPlayer</string>' \
+            '  <key>CFBundleExecutable</key><string>MusicPlayer</string>' \
+            '  <key>CFBundleIdentifier</key><string>com.philho.musicplayer</string>' \
+            '  <key>CFBundleIconFile</key><string>icon</string>' \
+            "  <key>CFBundleVersion</key><string>${VERSION}</string>" \
+            "  <key>CFBundleShortVersionString</key><string>${VERSION}</string>" \
+            '  <key>CFBundlePackageType</key><string>APPL</string>' \
+            '  <key>LSMinimumSystemVersion</key><string>11.0</string>' \
+            '  <key>NSHighResolutionCapable</key><true/>' \
+            '</dict>' \
+            '</plist>' > "$APP/Contents/Info.plist"
+
+          # ditto (not zip) preserves the .app bundle layout inside the archive.
+          ditto -c -k --keepParent "$APP" "MusicPlayer-macos-v${VERSION}.zip"
+          echo "Built MusicPlayer-macos-v${VERSION}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicPlayer-macos
+          path: MusicPlayer-macos-*.zip
+          if-no-files-found: error
+
+  # Single place that creates the Release, so the two build jobs never race to
+  # create it. Runs on tags only; still publishes Windows if the macOS build
+  # failed (download-artifact just grabs whatever artifacts exist).
+  release:
+    needs: [windows, macos]
+    if: always() && startsWith(github.ref, 'refs/tags/') && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to create the Release
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/MusicPlayer-*.zip
+          files: artifacts/**/*.zip
           generate_release_notes: true

@@ -10,11 +10,12 @@ is analyzed in Traktor. See `README.md` for the feature list.
 ## Repository & CI
 
 - GitHub: <https://github.com/PhilHo-Projects/MusicPlayer.git> (org `PhilHo-Projects`).
-- `.github/workflows/ci.yml` — fmt check, clippy, test, release build on push/PR
-  (Windows runner). Clippy is not yet `-D warnings`; see the note in the workflow.
-- `.github/workflows/release.yml` — on a `vX.Y.Z` tag, runs `scripts\package.ps1`
-  and attaches the zip to a GitHub Release. To cut a release: bump `version` in
-  `Cargo.toml`, commit, then `git tag vX.Y.Z && git push --tags`.
+- `.github/workflows/ci.yml` — fmt check, clippy (`-D warnings`), test, release
+  build on push/PR (Windows runner).
+- `.github/workflows/release.yml` — on a `vX.Y.Z` tag, builds the standalone
+  **Windows** exe (`scripts\package.ps1`) and a universal **macOS** `.app`
+  (unsigned) and attaches both to a GitHub Release. To cut a release: bump
+  `version` in `Cargo.toml`, commit, then `git tag vX.Y.Z && git push --tags`.
 
 ## Build & run on this machine
 
@@ -57,7 +58,13 @@ Always confirm an API against the crate source in
 - `app.rs` — UI + app state (`MusicPlayerApp`). Panels: top bar, **spectrum strip**
   (between album art and waveform), bottom transport (waveform + controls + clip
   meter), right **inspector** (collapsible Track info / Waveform / Equalizer
-  sections), central album art.
+  sections), central album art. **Settings persistence**: the spectrum + waveform
+  render params survive restarts via eframe storage (`App::save` +
+  `PersistedSettings`, RON at `%APPDATA%\MusicPlayer\data\app.ron`). Scope is
+  deliberate — `persist_window` (in `main.rs`) and `persist_egui_memory` are both
+  **off**, so *only* those two param sets persist, not window geometry / panel
+  layout. EQ isn't persisted (it lives in the audio engine). "Reset" just sets
+  defaults, which `save` then writes — so reset-then-close defaults the next launch.
 - `audio.rs` — `AudioEngine` (cpal stream + `Arc<Mutex<EngineShared>>`),
   `PlaybackState`, `EqProcessor` (biquad peaking, `EQ_BANDS_HZ`), channel remix
   and `rubato` resampling. Volume gain is linear (`PlaybackState::gain`); an

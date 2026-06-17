@@ -31,7 +31,7 @@ Copy-Item "target\release\music_player.exe" (Join-Path $dist "MusicPlayer.exe") 
 Copy-Item "README.md" (Join-Path $dist "README.md") -Force
 
 @"
-MusicPlayer (v$version) - early preview build
+MusicPlayer v$version
 
 Double-click MusicPlayer.exe to run. You can also drag an audio file onto it,
 or run from a terminal:  MusicPlayer.exe "path\to\track.mp3"

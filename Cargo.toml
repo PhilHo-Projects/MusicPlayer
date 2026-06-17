@@ -1,17 +1,18 @@
 [package]
 name = "music_player"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
 biquad = "0.6.0"
 cpal = "0.18.1"
-eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
 image = { version = "0.25.6", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 lofty = "0.24.0"
 realfft = "3.5.0"
 rfd = "0.17.2"
 rubato = "3.0.0"
+serde = { version = "1.0", features = ["derive"] }
 # `id3v1`/`id3v2` aren't for metadata (lofty reads that) — they register the tag
 # readers with symphonia's *probe* so it skips a leading ID3 tag instead of
 # scanning into it. Without them, files with embedded art (a JPEG full of 0xFF

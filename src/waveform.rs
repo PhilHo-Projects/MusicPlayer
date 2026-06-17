@@ -35,7 +35,7 @@ pub fn build_waveform(samples: &[f32], channels: usize, bin_count: usize) -> Vec
 }
 
 /// How a column of samples is collapsed into one drawn value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReductionMode {
     /// Loudest sample in the bin — accurate, but loud music fills the height.
     Peak,
@@ -44,7 +44,7 @@ pub enum ReductionMode {
 }
 
 /// How waveform columns are colored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColorMode {
     /// Single played/unplayed color.
     Solid,
@@ -54,7 +54,9 @@ pub enum ColorMode {
 
 /// Live, tweakable parameters for *drawing* the waveform. These never touch the
 /// stored analysis (which stays amplitude-accurate) — they only reshape the draw.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `#[serde(default)]` lets a persisted config survive fields being added/removed.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct WaveformParams {
     /// Number of drawn bars across the width.
     pub bins: usize,

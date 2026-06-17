@@ -30,7 +30,7 @@ pub const DB_CEIL: f32 = -18.0;
 const RELEASE: f32 = 0.88;
 
 /// Visual style for the spectrum strip.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SpectrumDisplayMode {
     /// Vertical bars with small gaps — classic equalizer look.
     Bars,
@@ -39,16 +39,16 @@ pub enum SpectrumDisplayMode {
 }
 
 /// Live, tweakable parameters for *drawing* the spectrum. Changing these is
-/// instant — the FFT history is unaffected.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// instant — the FFT history is unaffected. `#[serde(default)]` lets a stored
+/// config from an older/newer build load even if the field set has drifted.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SpectrumParams {
     pub mode: SpectrumDisplayMode,
     /// Lower dB limit (noise floor). A bar is at height 0 at this level.
     pub db_floor: f32,
     /// Upper dB limit (full height). A bar reaches height 1.0 at this level.
     pub db_ceil: f32,
-    /// Show floating peak-hold caps above the bars / line.
-    pub peak_caps: bool,
     /// Overall height multiplier applied after the dB map (0.25 – 3.0).
     pub sensitivity: f32,
     /// Mirror the display so the lowest frequency is in the center and the
@@ -62,7 +62,6 @@ impl Default for SpectrumParams {
             mode: SpectrumDisplayMode::Bars,
             db_floor: DB_FLOOR,
             db_ceil: DB_CEIL,
-            peak_caps: true,
             sensitivity: 1.0,
             symmetric: true,
         }
