@@ -16,6 +16,10 @@ use symphonia::core::{
 
 use crate::waveform::{WaveformAnalysis, analyze_waveform};
 
+/// Analysis resolution. Higher than the on-screen pixel width so the renderer can
+/// down-sample to the widget size cleanly instead of stretching a coarse buffer.
+pub const WAVEFORM_BINS: usize = 2000;
+
 #[derive(Clone, Debug)]
 pub struct DecodedTrack {
     pub path: PathBuf,
@@ -58,7 +62,7 @@ pub fn is_supported_extension(extension: &str) -> bool {
     )
 }
 
-pub fn decode_track(path: &Path) -> Result<DecodedTrack, DecodeError> {
+pub fn decode_track_unanalyzed(path: &Path) -> Result<DecodedTrack, DecodeError> {
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -178,10 +182,6 @@ pub fn decode_track(path: &Path) -> Result<DecodedTrack, DecodeError> {
 
     let frame_count = samples.len() / channels;
     let duration = Duration::from_secs_f64(frame_count as f64 / sample_rate as f64);
-    // Higher than the on-screen pixel width so the renderer can down-sample to
-    // the widget size cleanly instead of stretching a coarse buffer. Bakes peak,
-    // RMS, and low/mid/high band energies in one pass.
-    let waveform = analyze_waveform(&samples, channels, sample_rate, 2000);
 
     Ok(DecodedTrack {
         path: path.to_path_buf(),
@@ -189,6 +189,21 @@ pub fn decode_track(path: &Path) -> Result<DecodedTrack, DecodeError> {
         sample_rate,
         channels,
         duration,
-        waveform,
+        waveform: WaveformAnalysis::default(),
     })
+}
+
+/// Decode and bake the waveform in one call. Kept for the batch path and for
+/// callers that want a fully-formed track; the app's load path decodes without
+/// analysis so playback can start first, then analyses on a background thread.
+pub fn decode_track(path: &Path) -> Result<DecodedTrack, DecodeError> {
+    let mut decoded = decode_track_unanalyzed(path)?;
+    // Bakes peak, RMS, and low/mid/high band energies in one pass.
+    decoded.waveform = analyze_waveform(
+        &decoded.samples,
+        decoded.channels,
+        decoded.sample_rate,
+        WAVEFORM_BINS,
+    );
+    Ok(decoded)
 }

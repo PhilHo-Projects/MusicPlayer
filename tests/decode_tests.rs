@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use music_player::{
-    decoder::{DecodeError, decode_track},
+    decoder::{DecodeError, decode_track, decode_track_unanalyzed},
     metadata::read_track_info,
 };
 
@@ -34,6 +34,25 @@ fn decode_sizes_the_sample_buffer_once() {
     let decoded = decode_track(&path).expect("multi-packet WAV should decode");
 
     assert_eq!(decoded.samples.capacity(), decoded.samples.len());
+}
+
+#[test]
+fn unanalyzed_decode_returns_audio_without_the_waveform() {
+    // Phase 1 starts playback before the waveform exists, so the decode step has
+    // to be able to skip analysis. Everything except the waveform must be
+    // identical to a normal decode.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unanalyzed.wav");
+    write_ramp_wav(&path, 50_000);
+
+    let full = decode_track(&path).expect("WAV should decode");
+    let raw = decode_track_unanalyzed(&path).expect("WAV should decode");
+
+    assert!(raw.waveform.is_empty());
+    assert_eq!(raw.samples, full.samples);
+    assert_eq!(raw.sample_rate, full.sample_rate);
+    assert_eq!(raw.channels, full.channels);
+    assert_eq!(raw.duration, full.duration);
 }
 
 #[test]
