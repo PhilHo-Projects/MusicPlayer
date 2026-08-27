@@ -522,8 +522,11 @@ impl AudioEngine {
         self.output_channels
     }
 
-    pub fn load(&self, track: PlaybackBuffer) {
-        self.with_shared(|shared| shared.playback.load(Arc::new(track)));
+    /// Takes an `Arc` so the caller can keep a handle and analyze the same buffer
+    /// on a background thread — the waveform is computed from the audio the engine
+    /// is already playing rather than from a second copy of the track.
+    pub fn load(&self, track: Arc<PlaybackBuffer>) {
+        self.with_shared(|shared| shared.playback.load(track));
     }
 
     pub fn toggle_playback(&self) {

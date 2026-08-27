@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
+    sync::Arc,
     sync::mpsc::{Receiver, TryRecvError},
     time::Duration,
 };
@@ -15,10 +16,10 @@ use crate::{
         AudioEngine, EQ_BANDS_HZ, EqSettings, PlaybackBuffer, PlaybackSnapshot, TransportState,
         remix_channels, resample_interleaved,
     },
-    decoder::{DecodedTrack, decode_track},
+    decoder::{DecodedTrack, WAVEFORM_BINS, decode_track_unanalyzed},
     metadata::{CoverArt, TrackInfo, read_track_info},
     spectrum::{SpectrumAnalyzer, SpectrumDisplayMode, SpectrumParams},
-    waveform::{ColorMode, ReductionMode, WaveformParams},
+    waveform::{ColorMode, ReductionMode, WaveformAnalysis, WaveformParams, analyze_waveform},
 };
 
 pub struct MusicPlayerApp {
@@ -29,6 +30,9 @@ pub struct MusicPlayerApp {
     eq_settings: EqSettings,
     waveform_params: WaveformParams,
     pending_load: Option<Receiver<LoadOutcome>>,
+    /// In-flight background waveform analysis for the current track.
+    pending_analysis: Option<Receiver<(u64, WaveformAnalysis)>>,
+    analysis_gate: AnalysisGate,
     /// File-open requests forwarded from secondary launches (double-click in
     /// Explorer). `None` when single-instance IPC isn't wired up.
     file_rx: Option<Receiver<PathBuf>>,
@@ -168,6 +172,8 @@ impl MusicPlayerApp {
             eq_settings,
             waveform_params: settings.waveform,
             pending_load: None,
+            pending_analysis: None,
+            analysis_gate: AnalysisGate::default(),
             file_rx,
             spectrum,
             spectrum_params: settings.spectrum,
@@ -233,8 +239,29 @@ impl MusicPlayerApp {
                     buffer,
                 } = *data;
                 if let (Ok(engine), Some(buffer)) = (&self.audio, buffer) {
-                    engine.load(buffer);
+                    let buffer = Arc::new(buffer);
+                    engine.load(Arc::clone(&buffer));
                     engine.play();
+
+                    // Analysis no longer gates playback. It reads the very buffer
+                    // the engine is playing, so the track isn't duplicated, and
+                    // the result is stamped with a generation so a load started
+                    // while this one is still running can't be overwritten by it.
+                    // Note this is *post*-resample audio: identical to the decoded
+                    // samples on a rate-matched device (the normal case), and the
+                    // resampled stream otherwise - envelope-equivalent either way.
+                    let generation = self.analysis_gate.begin();
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    self.pending_analysis = Some(receiver);
+                    std::thread::spawn(move || {
+                        let analysis = analyze_waveform(
+                            &buffer.samples,
+                            buffer.channels,
+                            buffer.sample_rate,
+                            WAVEFORM_BINS,
+                        );
+                        let _ = sender.send((generation, analysis));
+                    });
                 }
                 self.cover_texture = info
                     .cover_art
@@ -243,6 +270,27 @@ impl MusicPlayerApp {
                 self.status = format!("Loaded {}", info.title);
                 self.track = Some(LoadedTrack { info, decoded });
             }
+        }
+    }
+
+    /// Apply a finished background waveform analysis, if one is ready. A result
+    /// from a superseded load is dropped rather than painted onto the track that
+    /// replaced it.
+    fn poll_analysis(&mut self) {
+        let Some(receiver) = &self.pending_analysis else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, analysis)) => {
+                self.pending_analysis = None;
+                if self.analysis_gate.accepts(generation)
+                    && let Some(track) = &mut self.track
+                {
+                    track.decoded.waveform = analysis;
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.pending_analysis = None,
         }
     }
 
@@ -304,6 +352,7 @@ impl eframe::App for MusicPlayerApp {
         self.handle_dropped_files(&ctx);
         self.poll_file_requests(&ctx);
         self.poll_load(&ctx);
+        self.poll_analysis();
         let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 0.1);
         self.update_visualizers(dt);
 
@@ -609,6 +658,15 @@ impl MusicPlayerApp {
 
         let analysis = &track.decoded.waveform;
         if analysis.is_empty() {
+            // The track is already playing at this point - the waveform is still
+            // being analyzed on a background thread.
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Analyzing waveform\u{2026}",
+                egui::TextStyle::Button.resolve(ui.style()),
+                Color32::from_gray(120),
+            );
             return;
         }
 
@@ -1125,7 +1183,7 @@ impl MusicPlayerApp {
 /// matching the audio device. `output` is the device's `(sample_rate, channels)`,
 /// or `None` when no audio engine is available (metadata/waveform only).
 fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
-    let mut decoded = match decode_track(&path) {
+    let mut decoded = match decode_track_unanalyzed(&path) {
         Ok(decoded) => decoded,
         Err(error) => return LoadOutcome::Failed(error.to_string()),
     };
