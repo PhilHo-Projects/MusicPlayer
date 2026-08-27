@@ -1,8 +1,10 @@
 use std::{fs, path::Path};
 
 use music_player::{
-    decoder::{DecodeError, decode_track, decode_track_unanalyzed},
+    audio::PlaybackBuffer,
+    decoder::{DecodeError, WAVEFORM_BINS, decode_track, decode_track_unanalyzed},
     metadata::read_track_info,
+    waveform::analyze_waveform,
 };
 
 #[test]
@@ -53,6 +55,37 @@ fn unanalyzed_decode_returns_audio_without_the_waveform() {
     assert_eq!(raw.sample_rate, full.sample_rate);
     assert_eq!(raw.channels, full.channels);
     assert_eq!(raw.duration, full.duration);
+}
+
+#[test]
+fn analysis_from_the_playback_buffer_matches_the_decode_time_waveform() {
+    // Phase 1 moves analysis off the decode thread, where it reads the buffer the
+    // engine already holds — that is post-resample data. On a device whose rate
+    // and layout match the file (the common case, and this machine's) it is the
+    // same samples, so the drawn waveform must not change at all.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("equivalence.wav");
+    write_ramp_wav(&path, 50_000);
+
+    let decoded = decode_track(&path).expect("WAV should decode");
+    let buffer = PlaybackBuffer::new(
+        decoded.samples.clone(),
+        decoded.sample_rate,
+        decoded.channels,
+    );
+
+    let from_buffer = analyze_waveform(
+        &buffer.samples,
+        buffer.channels,
+        buffer.sample_rate,
+        WAVEFORM_BINS,
+    );
+
+    assert_eq!(from_buffer.peak, decoded.waveform.peak);
+    assert_eq!(from_buffer.rms, decoded.waveform.rms);
+    assert_eq!(from_buffer.low, decoded.waveform.low);
+    assert_eq!(from_buffer.mid, decoded.waveform.mid);
+    assert_eq!(from_buffer.high, decoded.waveform.high);
 }
 
 #[test]
