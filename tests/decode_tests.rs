@@ -21,6 +21,22 @@ fn wav_decode_returns_samples_properties_and_waveform() {
 }
 
 #[test]
+fn decode_sizes_the_sample_buffer_once() {
+    // Growing to a track-sized buffer by doubling costs a full extra copy and a
+    // 1.5x memory spike at the final realloc — on a two-hour set that is over a
+    // gigabyte of avoidable churn. The demuxer reports the frame count up front,
+    // so the buffer should be allocated at its final size.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("prealloc.wav");
+    let frames = 50_000;
+    write_ramp_wav(&path, frames);
+
+    let decoded = decode_track(&path).expect("multi-packet WAV should decode");
+
+    assert_eq!(decoded.samples.capacity(), decoded.samples.len());
+}
+
+#[test]
 fn wav_decode_accumulates_all_packets() {
     // A file large enough to span many decoder packets. Regression guard for a
     // bug where the decode loop kept only the final packet (so playback was a

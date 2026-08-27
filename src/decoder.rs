@@ -98,6 +98,7 @@ pub fn decode_track(path: &Path) -> Result<DecodedTrack, DecodeError> {
             })?;
 
     let track_id = track.id;
+    let num_frames = track.num_frames;
     let codec_params = track
         .codec_params
         .as_ref()
@@ -122,6 +123,14 @@ pub fn decode_track(path: &Path) -> Result<DecodedTrack, DecodeError> {
         })?;
 
     let mut samples = Vec::new();
+    if let Some(frames) = num_frames {
+        // Size the buffer from the demuxer's frame count instead of growing by
+        // doubling: on a long set that saves a full extra copy of the track plus
+        // the 1.5x spike at the final realloc. `try_reserve_exact` keeps a corrupt
+        // header's absurd count from aborting the process — it just falls back to
+        // growth.
+        let _ = samples.try_reserve_exact((frames as usize).saturating_mul(channels));
+    }
     // `copy_to_vec_interleaved` resizes the destination to the *current* packet's
     // length and overwrites it, so it must target a scratch buffer that we then
     // append to the full track — otherwise only the final packet survives.

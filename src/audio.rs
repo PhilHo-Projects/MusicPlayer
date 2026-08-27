@@ -604,13 +604,20 @@ fn fill_output_u16(output: &mut [u16], shared: &Arc<Mutex<EngineShared>>) {
     }
 }
 
-pub fn remix_channels(samples: &[f32], input_channels: usize, output_channels: usize) -> Vec<f32> {
+/// Takes the buffer by value so the common case — a device whose layout already
+/// matches the file — hands the same allocation straight back instead of cloning
+/// the whole track.
+pub fn remix_channels(
+    samples: Vec<f32>,
+    input_channels: usize,
+    output_channels: usize,
+) -> Vec<f32> {
     if samples.is_empty() || input_channels == 0 || output_channels == 0 {
         return Vec::new();
     }
 
     if input_channels == output_channels {
-        return samples.to_vec();
+        return samples;
     }
 
     let frame_count = samples.len() / input_channels;
@@ -637,8 +644,10 @@ pub fn remix_channels(samples: &[f32], input_channels: usize, output_channels: u
     remixed
 }
 
+/// Takes the buffer by value so a device already running at the file's rate
+/// returns the same allocation rather than a full duplicate of the track.
 pub fn resample_interleaved(
-    samples: &[f32],
+    samples: Vec<f32>,
     channels: usize,
     input_rate: u32,
     output_rate: u32,
@@ -650,7 +659,7 @@ pub fn resample_interleaved(
         return Err(AudioProcessError::InvalidInterleavedLength);
     }
     if input_rate == output_rate {
-        return Ok(samples.to_vec());
+        return Ok(samples);
     }
     if samples.is_empty() {
         return Ok(Vec::new());
@@ -660,7 +669,7 @@ pub fn resample_interleaved(
     // Resample directly in f32. Promoting the whole clip to f64 (and back) just
     // to feed the resampler doubled both the memory footprint and the work for
     // no audible benefit.
-    let input_adapter = InterleavedSlice::new(samples, channels, input_frames)
+    let input_adapter = InterleavedSlice::new(&samples, channels, input_frames)
         .map_err(|error| AudioProcessError::Resample(error.to_string()))?;
 
     let chunk_size = input_frames.clamp(16, 4096);

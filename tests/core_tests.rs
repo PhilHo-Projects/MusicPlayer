@@ -1,6 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use music_player::{
+    app::output_path_summary,
     audio::{EQ_BANDS_HZ, EqSettings, clamp_seek_seconds},
     decoder::is_supported_extension,
     metadata::{TrackInfo, metadata_fallback_from_path},
@@ -82,4 +83,40 @@ fn supported_extension_scope_is_limited_to_v1_audio_formats() {
     assert!(is_supported_extension("aac"));
     assert!(!is_supported_extension("ogg"));
     assert!(!is_supported_extension("wem"));
+}
+
+#[test]
+fn output_summary_reports_a_direct_path_when_the_device_matches() {
+    // The player follows the device's mix format, so a device already at the
+    // file's rate plays untouched. Surfacing that is the point of the read-out:
+    // WASAPI shared mode converts to the mix format regardless, so a conversion
+    // here would mean the audio is being resampled twice.
+    assert_eq!(
+        output_path_summary(44_100, 2, 44_100, 2),
+        "44100 Hz - direct"
+    );
+}
+
+#[test]
+fn output_summary_reports_the_conversion_when_rates_differ() {
+    assert_eq!(
+        output_path_summary(44_100, 2, 48_000, 2),
+        "44100 -> 48000 Hz - resampled"
+    );
+}
+
+#[test]
+fn output_summary_reports_a_channel_remix() {
+    assert_eq!(
+        output_path_summary(44_100, 2, 44_100, 1),
+        "44100 Hz - 2 -> 1 ch"
+    );
+}
+
+#[test]
+fn output_summary_reports_rate_and_channel_changes_together() {
+    assert_eq!(
+        output_path_summary(44_100, 1, 48_000, 2),
+        "44100 -> 48000 Hz - 1 -> 2 ch"
+    );
 }

@@ -71,6 +71,15 @@ Always confirm an API against the crate source in
   earlier log taper was reverted because it made the bottom half nearly silent.
   `VizTap` captures the final mono mix + pre-clamp peak/clip for the visualizers;
   the UI drains it via `AudioEngine::drain_viz`.
+  **Load path is zero-copy on purpose**: `resample_interleaved` and
+  `remix_channels` take `Vec<f32>` *by value* and hand the same allocation back
+  when the device already matches the file, and `load_track` moves
+  `decoded.samples` into the playback buffer rather than cloning it. Taking
+  slices instead would restore three live copies of the track — 7.2 GB peak on a
+  two-hour set, which is what made long sets stall. The `*_reuses_allocation_*`
+  tests in `audio_processing_tests` pin this via pointer identity.
+  The app follows the device's mix format and offers **no rate override**: cpal
+  drives WASAPI in shared mode only, so anything else would resample twice.
 - `spectrum.rs` — `SpectrumAnalyzer`: one `realfft` pass per frame over the tapped
   output → log-spaced bars + peak-hold caps. Purely cosmetic (like `WaveformParams`).
 - `decoder.rs` — `decode_track` → `DecodedTrack { samples, …, waveform }`.

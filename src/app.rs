@@ -427,6 +427,18 @@ impl MusicPlayerApp {
         if let Some(bitrate) = track.info.bitrate {
             metadata_row(ui, "Bitrate", &format!("{bitrate} kbps"));
         }
+        if let Ok(engine) = &self.audio {
+            metadata_row(
+                ui,
+                "Output",
+                &output_path_summary(
+                    track.decoded.sample_rate,
+                    track.decoded.channels,
+                    engine.output_sample_rate(),
+                    engine.output_channels(),
+                ),
+            );
+        }
         if track.info.traktor_analyzed {
             metadata_row(ui, "Analyzed", "Traktor");
         }
@@ -1094,7 +1106,7 @@ impl MusicPlayerApp {
 /// matching the audio device. `output` is the device's `(sample_rate, channels)`,
 /// or `None` when no audio engine is available (metadata/waveform only).
 fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
-    let decoded = match decode_track(&path) {
+    let mut decoded = match decode_track(&path) {
         Ok(decoded) => decoded,
         Err(error) => return LoadOutcome::Failed(error.to_string()),
     };
@@ -1104,9 +1116,21 @@ fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
     info.sample_rate = Some(decoded.sample_rate);
     info.channels = Some(decoded.channels as u16);
 
+    // The raw samples feed the playback buffer and nothing else — the waveform
+    // analysis is already baked. Move them out so the `DecodedTrack` we retain
+    // for the rest of the session isn't holding a second full copy of the track
+    // (>2 GB on a two-hour set).
+    let samples = std::mem::take(&mut decoded.samples);
+
     let buffer = match output {
         Some((sample_rate, channels)) => {
-            match prepare_playback_buffer(&decoded, sample_rate, channels) {
+            match prepare_playback_buffer(
+                samples,
+                decoded.channels,
+                decoded.sample_rate,
+                sample_rate,
+                channels,
+            ) {
                 Ok(buffer) => Some(buffer),
                 Err(error) => return LoadOutcome::Failed(error.to_string()),
             }
@@ -1121,18 +1145,18 @@ fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
     }))
 }
 
+/// Consumes the decoded samples: when the device already matches the file's rate
+/// and layout both steps hand the same allocation through, so a matching device
+/// costs no extra copy of the track at all.
 fn prepare_playback_buffer(
-    decoded: &DecodedTrack,
+    samples: Vec<f32>,
+    channels: usize,
+    sample_rate: u32,
     output_sample_rate: u32,
     output_channels: usize,
 ) -> Result<PlaybackBuffer, crate::audio::AudioProcessError> {
-    let resampled = resample_interleaved(
-        &decoded.samples,
-        decoded.channels,
-        decoded.sample_rate,
-        output_sample_rate,
-    )?;
-    let remixed = remix_channels(&resampled, decoded.channels, output_channels);
+    let resampled = resample_interleaved(samples, channels, sample_rate, output_sample_rate)?;
+    let remixed = remix_channels(resampled, channels, output_channels);
     Ok(PlaybackBuffer::new(
         remixed,
         output_sample_rate,
@@ -1174,6 +1198,34 @@ fn metadata_row(ui: &mut egui::Ui, label: &str, value: &str) {
             .color(Color32::from_gray(130)),
     );
     ui.label(RichText::new(value).color(Color32::from_gray(215)));
+}
+
+/// One line describing what happens between the file and the audio device.
+///
+/// The player always follows the device's mix format and deliberately offers no
+/// rate override: cpal drives WASAPI in *shared* mode, where Windows converts to
+/// the mix format regardless, so asking for anything else would resample twice
+/// (ours, then Windows') for strictly worse quality. This read-out makes the
+/// resulting path visible — "direct" means the track reaches the device untouched.
+pub fn output_path_summary(
+    file_rate: u32,
+    file_channels: usize,
+    device_rate: u32,
+    device_channels: usize,
+) -> String {
+    let rate = if file_rate == device_rate {
+        format!("{file_rate} Hz")
+    } else {
+        format!("{file_rate} -> {device_rate} Hz")
+    };
+
+    if file_channels != device_channels {
+        format!("{rate} - {file_channels} -> {device_channels} ch")
+    } else if file_rate == device_rate {
+        format!("{rate} - direct")
+    } else {
+        format!("{rate} - resampled")
+    }
 }
 
 fn optional_text(value: &Option<String>) -> &str {

@@ -10,7 +10,7 @@ use music_player::audio::{
 fn remix_channels_averages_stereo_to_mono() {
     let stereo = vec![1.0, -1.0, 0.5, 0.25];
 
-    let mono = remix_channels(&stereo, 2, 1);
+    let mono = remix_channels(stereo, 2, 1);
 
     assert_eq!(mono, vec![0.0, 0.375]);
 }
@@ -19,7 +19,7 @@ fn remix_channels_averages_stereo_to_mono() {
 fn remix_channels_duplicates_mono_to_stereo() {
     let mono = vec![0.25, -0.5];
 
-    let stereo = remix_channels(&mono, 1, 2);
+    let stereo = remix_channels(mono, 1, 2);
 
     assert_eq!(stereo, vec![0.25, 0.25, -0.5, -0.5]);
 }
@@ -28,7 +28,7 @@ fn remix_channels_duplicates_mono_to_stereo() {
 fn resample_interleaved_preserves_audio_when_rates_match() {
     let samples = vec![0.0, 0.25, -0.25, 0.5];
 
-    let resampled = resample_interleaved(&samples, 2, 44_100, 44_100).unwrap();
+    let resampled = resample_interleaved(samples.clone(), 2, 44_100, 44_100).unwrap();
 
     assert_eq!(resampled, samples);
 }
@@ -37,10 +37,33 @@ fn resample_interleaved_preserves_audio_when_rates_match() {
 fn resample_interleaved_changes_frame_count_when_rate_changes() {
     let samples = vec![0.0_f32; 44_100 * 2];
 
-    let resampled = resample_interleaved(&samples, 2, 44_100, 48_000).unwrap();
+    let resampled = resample_interleaved(samples, 2, 44_100, 48_000).unwrap();
 
     let frames = resampled.len() / 2;
     assert!((47_900..=48_100).contains(&frames));
+}
+
+#[test]
+fn resample_interleaved_reuses_allocation_when_rates_match() {
+    // A device already running at the file's rate must hand the buffer straight
+    // back. Copying instead costs a full duplicate of the track — >2 GB on a
+    // two-hour set, which is what pushed long sets into swap.
+    let samples = vec![0.0, 0.25, -0.25, 0.5];
+    let original = samples.as_ptr();
+
+    let resampled = resample_interleaved(samples, 2, 44_100, 44_100).unwrap();
+
+    assert_eq!(resampled.as_ptr(), original);
+}
+
+#[test]
+fn remix_channels_reuses_allocation_when_layout_matches() {
+    let stereo = vec![1.0, -1.0, 0.5, 0.25];
+    let original = stereo.as_ptr();
+
+    let remixed = remix_channels(stereo, 2, 2);
+
+    assert_eq!(remixed.as_ptr(), original);
 }
 
 #[test]
