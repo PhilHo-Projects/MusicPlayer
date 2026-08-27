@@ -40,6 +40,25 @@ pub struct MusicPlayerApp {
     viz_samples: Vec<f32>,
 }
 
+/// Stamps each load with a generation so a background waveform result from a
+/// superseded load can be discarded instead of painting over the current track.
+/// Generation 0 is never issued, so a default gate accepts nothing.
+#[derive(Default)]
+pub struct AnalysisGate {
+    current: u64,
+}
+
+impl AnalysisGate {
+    pub fn begin(&mut self) -> u64 {
+        self.current += 1;
+        self.current
+    }
+
+    pub fn accepts(&self, generation: u64) -> bool {
+        generation != 0 && generation == self.current
+    }
+}
+
 struct LoadedTrack {
     info: TrackInfo,
     decoded: DecodedTrack,

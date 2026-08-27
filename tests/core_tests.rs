@@ -1,7 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use music_player::{
-    app::output_path_summary,
+    app::{AnalysisGate, output_path_summary},
     audio::{EQ_BANDS_HZ, EqSettings, clamp_seek_seconds},
     decoder::is_supported_extension,
     metadata::{TrackInfo, metadata_fallback_from_path},
@@ -119,4 +119,24 @@ fn output_summary_reports_rate_and_channel_changes_together() {
         output_path_summary(44_100, 1, 48_000, 2),
         "44100 -> 48000 Hz - 1 -> 2 ch"
     );
+}
+
+#[test]
+fn analysis_gate_rejects_results_from_a_superseded_load() {
+    // Opening a second file mid-analysis must not let the first file's waveform
+    // land on the second file's track.
+    let mut gate = AnalysisGate::default();
+    let first = gate.begin();
+    let second = gate.begin();
+
+    assert!(!gate.accepts(first));
+    assert!(gate.accepts(second));
+}
+
+#[test]
+fn analysis_gate_accepts_nothing_before_any_load_starts() {
+    // Guards the zero value: a default gate must not accept generation 0.
+    let gate = AnalysisGate::default();
+
+    assert!(!gate.accepts(0));
 }
