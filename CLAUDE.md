@@ -65,15 +65,33 @@ Always confirm an API against the crate source in
   **off**, so *only* those two param sets persist, not window geometry / panel
   layout. EQ isn't persisted (it lives in the audio engine). "Reset" just sets
   defaults, which `save` then writes — so reset-then-close defaults the next launch.
+  **Loading is two-stage**: the load thread decodes and hands the engine an
+  `Arc<PlaybackBuffer>`, playback starts immediately, then a second thread
+  analyzes *that same Arc* (so the track is never duplicated) and posts the
+  waveform back via `poll_analysis`. Results carry an `AnalysisGate` generation
+  so a superseded load can't paint its waveform onto the track that replaced it.
+  On a rate-matched device that post-resample analysis is byte-identical to
+  analyzing the decoded samples — pinned by a test in `decode_tests`.
 - `audio.rs` — `AudioEngine` (cpal stream + `Arc<Mutex<EngineShared>>`),
   `PlaybackState`, `EqProcessor` (biquad peaking, `EQ_BANDS_HZ`), channel remix
   and `rubato` resampling. Volume gain is linear (`PlaybackState::gain`); an
   earlier log taper was reverted because it made the bottom half nearly silent.
   `VizTap` captures the final mono mix + pre-clamp peak/clip for the visualizers;
   the UI drains it via `AudioEngine::drain_viz`.
+  **Load path is zero-copy on purpose**: `resample_interleaved` and
+  `remix_channels` take `Vec<f32>` *by value* and hand the same allocation back
+  when the device already matches the file, and `load_track` moves
+  `decoded.samples` into the playback buffer rather than cloning it. Taking
+  slices instead would restore three live copies of the track — 7.2 GB peak on a
+  two-hour set, which is what made long sets stall. The `*_reuses_allocation_*`
+  tests in `audio_processing_tests` pin this via pointer identity.
+  The app follows the device's mix format and offers **no rate override**: cpal
+  drives WASAPI in shared mode only, so anything else would resample twice.
 - `spectrum.rs` — `SpectrumAnalyzer`: one `realfft` pass per frame over the tapped
   output → log-spaced bars + peak-hold caps. Purely cosmetic (like `WaveformParams`).
-- `decoder.rs` — `decode_track` → `DecodedTrack { samples, …, waveform }`.
+- `decoder.rs` — `decode_track_unanalyzed` → `DecodedTrack` with an empty
+  waveform; `decode_track` adds the analysis on top. The app's load path uses the
+  unanalyzed form so playback can start before the waveform exists.
 - `metadata.rs` — `read_track_info` via `lofty`; BPM/key/Traktor fields.
 - `waveform.rs` — analysis + render params (see below).
 - `single_instance.rs` — loopback-socket guard: a second launch (double-clicking
@@ -95,7 +113,8 @@ Always confirm an API against the crate source in
 
 Two layers, kept separate on purpose:
 
-1. **Analysis** (`WaveformAnalysis`, baked once in `analyze_waveform` at decode):
+1. **Analysis** (`WaveformAnalysis`, baked once by `analyze_waveform` on a
+   background thread just after playback starts):
    `peak`, `rms`, and `low`/`mid`/`high` band energies (biquad LP 250 / BP 900 /
    HP 4000 over a mono mixdown). Amplitude-accurate; never mutated by the UI.
 2. **Render params** (`WaveformParams`, live in `app.rs`): bars, reduction

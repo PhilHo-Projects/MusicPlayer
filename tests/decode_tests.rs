@@ -1,8 +1,10 @@
 use std::{fs, path::Path};
 
 use music_player::{
-    decoder::{DecodeError, decode_track},
+    audio::PlaybackBuffer,
+    decoder::{DecodeError, WAVEFORM_BINS, decode_track, decode_track_unanalyzed},
     metadata::read_track_info,
+    waveform::analyze_waveform,
 };
 
 #[test]
@@ -18,6 +20,72 @@ fn wav_decode_returns_samples_properties_and_waveform() {
     assert_eq!(decoded.samples.len(), 8);
     assert!(decoded.duration.as_secs_f32() > 0.0);
     assert_eq!(decoded.waveform.len(), 2000);
+}
+
+#[test]
+fn decode_sizes_the_sample_buffer_once() {
+    // Growing to a track-sized buffer by doubling costs a full extra copy and a
+    // 1.5x memory spike at the final realloc — on a two-hour set that is over a
+    // gigabyte of avoidable churn. The demuxer reports the frame count up front,
+    // so the buffer should be allocated at its final size.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("prealloc.wav");
+    let frames = 50_000;
+    write_ramp_wav(&path, frames);
+
+    let decoded = decode_track(&path).expect("multi-packet WAV should decode");
+
+    assert_eq!(decoded.samples.capacity(), decoded.samples.len());
+}
+
+#[test]
+fn unanalyzed_decode_returns_audio_without_the_waveform() {
+    // Phase 1 starts playback before the waveform exists, so the decode step has
+    // to be able to skip analysis. Everything except the waveform must be
+    // identical to a normal decode.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unanalyzed.wav");
+    write_ramp_wav(&path, 50_000);
+
+    let full = decode_track(&path).expect("WAV should decode");
+    let raw = decode_track_unanalyzed(&path).expect("WAV should decode");
+
+    assert!(raw.waveform.is_empty());
+    assert_eq!(raw.samples, full.samples);
+    assert_eq!(raw.sample_rate, full.sample_rate);
+    assert_eq!(raw.channels, full.channels);
+    assert_eq!(raw.duration, full.duration);
+}
+
+#[test]
+fn analysis_from_the_playback_buffer_matches_the_decode_time_waveform() {
+    // Phase 1 moves analysis off the decode thread, where it reads the buffer the
+    // engine already holds — that is post-resample data. On a device whose rate
+    // and layout match the file (the common case, and this machine's) it is the
+    // same samples, so the drawn waveform must not change at all.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("equivalence.wav");
+    write_ramp_wav(&path, 50_000);
+
+    let decoded = decode_track(&path).expect("WAV should decode");
+    let buffer = PlaybackBuffer::new(
+        decoded.samples.clone(),
+        decoded.sample_rate,
+        decoded.channels,
+    );
+
+    let from_buffer = analyze_waveform(
+        &buffer.samples,
+        buffer.channels,
+        buffer.sample_rate,
+        WAVEFORM_BINS,
+    );
+
+    assert_eq!(from_buffer.peak, decoded.waveform.peak);
+    assert_eq!(from_buffer.rms, decoded.waveform.rms);
+    assert_eq!(from_buffer.low, decoded.waveform.low);
+    assert_eq!(from_buffer.mid, decoded.waveform.mid);
+    assert_eq!(from_buffer.high, decoded.waveform.high);
 }
 
 #[test]

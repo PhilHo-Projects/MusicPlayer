@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
+    sync::Arc,
     sync::mpsc::{Receiver, TryRecvError},
     time::Duration,
 };
@@ -15,10 +16,10 @@ use crate::{
         AudioEngine, EQ_BANDS_HZ, EqSettings, PlaybackBuffer, PlaybackSnapshot, TransportState,
         remix_channels, resample_interleaved,
     },
-    decoder::{DecodedTrack, decode_track},
+    decoder::{DecodedTrack, WAVEFORM_BINS, decode_track_unanalyzed},
     metadata::{CoverArt, TrackInfo, read_track_info},
     spectrum::{SpectrumAnalyzer, SpectrumDisplayMode, SpectrumParams},
-    waveform::{ColorMode, ReductionMode, WaveformParams},
+    waveform::{ColorMode, ReductionMode, WaveformAnalysis, WaveformParams, analyze_waveform},
 };
 
 pub struct MusicPlayerApp {
@@ -29,6 +30,9 @@ pub struct MusicPlayerApp {
     eq_settings: EqSettings,
     waveform_params: WaveformParams,
     pending_load: Option<Receiver<LoadOutcome>>,
+    /// In-flight background waveform analysis for the current track.
+    pending_analysis: Option<Receiver<(u64, WaveformAnalysis)>>,
+    analysis_gate: AnalysisGate,
     /// File-open requests forwarded from secondary launches (double-click in
     /// Explorer). `None` when single-instance IPC isn't wired up.
     file_rx: Option<Receiver<PathBuf>>,
@@ -38,6 +42,25 @@ pub struct MusicPlayerApp {
     clip_meter: ClipMeter,
     /// Reused scratch for draining the audio tap each frame.
     viz_samples: Vec<f32>,
+}
+
+/// Stamps each load with a generation so a background waveform result from a
+/// superseded load can be discarded instead of painting over the current track.
+/// Generation 0 is never issued, so a default gate accepts nothing.
+#[derive(Default)]
+pub struct AnalysisGate {
+    current: u64,
+}
+
+impl AnalysisGate {
+    pub fn begin(&mut self) -> u64 {
+        self.current += 1;
+        self.current
+    }
+
+    pub fn accepts(&self, generation: u64) -> bool {
+        generation != 0 && generation == self.current
+    }
 }
 
 struct LoadedTrack {
@@ -149,6 +172,8 @@ impl MusicPlayerApp {
             eq_settings,
             waveform_params: settings.waveform,
             pending_load: None,
+            pending_analysis: None,
+            analysis_gate: AnalysisGate::default(),
             file_rx,
             spectrum,
             spectrum_params: settings.spectrum,
@@ -214,8 +239,29 @@ impl MusicPlayerApp {
                     buffer,
                 } = *data;
                 if let (Ok(engine), Some(buffer)) = (&self.audio, buffer) {
-                    engine.load(buffer);
+                    let buffer = Arc::new(buffer);
+                    engine.load(Arc::clone(&buffer));
                     engine.play();
+
+                    // Analysis no longer gates playback. It reads the very buffer
+                    // the engine is playing, so the track isn't duplicated, and
+                    // the result is stamped with a generation so a load started
+                    // while this one is still running can't be overwritten by it.
+                    // Note this is *post*-resample audio: identical to the decoded
+                    // samples on a rate-matched device (the normal case), and the
+                    // resampled stream otherwise - envelope-equivalent either way.
+                    let generation = self.analysis_gate.begin();
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    self.pending_analysis = Some(receiver);
+                    std::thread::spawn(move || {
+                        let analysis = analyze_waveform(
+                            &buffer.samples,
+                            buffer.channels,
+                            buffer.sample_rate,
+                            WAVEFORM_BINS,
+                        );
+                        let _ = sender.send((generation, analysis));
+                    });
                 }
                 self.cover_texture = info
                     .cover_art
@@ -224,6 +270,27 @@ impl MusicPlayerApp {
                 self.status = format!("Loaded {}", info.title);
                 self.track = Some(LoadedTrack { info, decoded });
             }
+        }
+    }
+
+    /// Apply a finished background waveform analysis, if one is ready. A result
+    /// from a superseded load is dropped rather than painted onto the track that
+    /// replaced it.
+    fn poll_analysis(&mut self) {
+        let Some(receiver) = &self.pending_analysis else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, analysis)) => {
+                self.pending_analysis = None;
+                if self.analysis_gate.accepts(generation)
+                    && let Some(track) = &mut self.track
+                {
+                    track.decoded.waveform = analysis;
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.pending_analysis = None,
         }
     }
 
@@ -285,6 +352,7 @@ impl eframe::App for MusicPlayerApp {
         self.handle_dropped_files(&ctx);
         self.poll_file_requests(&ctx);
         self.poll_load(&ctx);
+        self.poll_analysis();
         let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 0.1);
         self.update_visualizers(dt);
 
@@ -379,7 +447,7 @@ impl MusicPlayerApp {
                 ui.painter().rect_stroke(
                     rect,
                     0.0,
-                    egui::Stroke::new(1.0, Color32::from_rgb(82, 82, 82)),
+                    egui::Stroke::new(1.0_f32, Color32::from_rgb(82, 82, 82)),
                     egui::StrokeKind::Inside,
                 );
 
@@ -426,6 +494,18 @@ impl MusicPlayerApp {
         metadata_row(ui, "Duration", &format_duration(track.decoded.duration));
         if let Some(bitrate) = track.info.bitrate {
             metadata_row(ui, "Bitrate", &format!("{bitrate} kbps"));
+        }
+        if let Ok(engine) = &self.audio {
+            metadata_row(
+                ui,
+                "Output",
+                &output_path_summary(
+                    track.decoded.sample_rate,
+                    track.decoded.channels,
+                    engine.output_sample_rate(),
+                    engine.output_channels(),
+                ),
+            );
         }
         if track.info.traktor_analyzed {
             metadata_row(ui, "Analyzed", "Traktor");
@@ -578,6 +658,15 @@ impl MusicPlayerApp {
 
         let analysis = &track.decoded.waveform;
         if analysis.is_empty() {
+            // The track is already playing at this point - the waveform is still
+            // being analyzed on a background thread.
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Analyzing waveform\u{2026}",
+                egui::TextStyle::Button.resolve(ui.style()),
+                Color32::from_gray(120),
+            );
             return;
         }
 
@@ -672,7 +761,7 @@ impl MusicPlayerApp {
                 Pos2::new(played_x, rect.top()),
                 Pos2::new(played_x, rect.bottom()),
             ],
-            Stroke::new(1.0, Color32::from_rgb(170, 210, 225)),
+            Stroke::new(1.0_f32, Color32::from_rgb(170, 210, 225)),
         );
     }
 
@@ -762,7 +851,7 @@ impl MusicPlayerApp {
                             let cy = baseline - sp(li, half_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(lx, cy), Pos2::new(lx + bw, cy)],
-                                Stroke::new(1.5, cap_color),
+                                Stroke::new(1.5_f32, cap_color),
                             );
                         }
 
@@ -785,7 +874,7 @@ impl MusicPlayerApp {
                             let cy = baseline - sp(d, half_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(rx, cy), Pos2::new(rx + bw, cy)],
-                                Stroke::new(1.5, cap_color),
+                                Stroke::new(1.5_f32, cap_color),
                             );
                         }
                     }
@@ -835,7 +924,7 @@ impl MusicPlayerApp {
                         .collect();
                     painter.add(egui::Shape::line(
                         ridge,
-                        Stroke::new(1.5, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
+                        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
                     ));
                 }
             }
@@ -869,7 +958,7 @@ impl MusicPlayerApp {
                             let cy = baseline - sp(i, display_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(x, cy), Pos2::new(x + bw, cy)],
-                                Stroke::new(1.5, cap_color),
+                                Stroke::new(1.5_f32, cap_color),
                             );
                         }
                     }
@@ -900,7 +989,7 @@ impl MusicPlayerApp {
                         .collect();
                     painter.add(egui::Shape::line(
                         pts,
-                        Stroke::new(1.5, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
+                        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
                     ));
                 }
             }
@@ -929,7 +1018,7 @@ impl MusicPlayerApp {
                 Pos2::new(inset.left(), cap_y),
                 Pos2::new(inset.right(), cap_y),
             ],
-            Stroke::new(1.5, Color32::from_rgba_unmultiplied(235, 235, 235, 200)),
+            Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(235, 235, 235, 200)),
         );
 
         // Clip latch: a solid red block at the very top after a true full-scale
@@ -946,7 +1035,7 @@ impl MusicPlayerApp {
         painter.rect_stroke(
             rect,
             3.0,
-            Stroke::new(1.0, Color32::from_rgb(64, 64, 64)),
+            Stroke::new(1.0_f32, Color32::from_rgb(64, 64, 64)),
             egui::StrokeKind::Inside,
         );
     }
@@ -1094,7 +1183,7 @@ impl MusicPlayerApp {
 /// matching the audio device. `output` is the device's `(sample_rate, channels)`,
 /// or `None` when no audio engine is available (metadata/waveform only).
 fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
-    let decoded = match decode_track(&path) {
+    let mut decoded = match decode_track_unanalyzed(&path) {
         Ok(decoded) => decoded,
         Err(error) => return LoadOutcome::Failed(error.to_string()),
     };
@@ -1104,9 +1193,21 @@ fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
     info.sample_rate = Some(decoded.sample_rate);
     info.channels = Some(decoded.channels as u16);
 
+    // The raw samples feed the playback buffer and nothing else — the waveform
+    // analysis is already baked. Move them out so the `DecodedTrack` we retain
+    // for the rest of the session isn't holding a second full copy of the track
+    // (>2 GB on a two-hour set).
+    let samples = std::mem::take(&mut decoded.samples);
+
     let buffer = match output {
         Some((sample_rate, channels)) => {
-            match prepare_playback_buffer(&decoded, sample_rate, channels) {
+            match prepare_playback_buffer(
+                samples,
+                decoded.channels,
+                decoded.sample_rate,
+                sample_rate,
+                channels,
+            ) {
                 Ok(buffer) => Some(buffer),
                 Err(error) => return LoadOutcome::Failed(error.to_string()),
             }
@@ -1121,18 +1222,18 @@ fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
     }))
 }
 
+/// Consumes the decoded samples: when the device already matches the file's rate
+/// and layout both steps hand the same allocation through, so a matching device
+/// costs no extra copy of the track at all.
 fn prepare_playback_buffer(
-    decoded: &DecodedTrack,
+    samples: Vec<f32>,
+    channels: usize,
+    sample_rate: u32,
     output_sample_rate: u32,
     output_channels: usize,
 ) -> Result<PlaybackBuffer, crate::audio::AudioProcessError> {
-    let resampled = resample_interleaved(
-        &decoded.samples,
-        decoded.channels,
-        decoded.sample_rate,
-        output_sample_rate,
-    )?;
-    let remixed = remix_channels(&resampled, decoded.channels, output_channels);
+    let resampled = resample_interleaved(samples, channels, sample_rate, output_sample_rate)?;
+    let remixed = remix_channels(resampled, channels, output_channels);
     Ok(PlaybackBuffer::new(
         remixed,
         output_sample_rate,
@@ -1174,6 +1275,34 @@ fn metadata_row(ui: &mut egui::Ui, label: &str, value: &str) {
             .color(Color32::from_gray(130)),
     );
     ui.label(RichText::new(value).color(Color32::from_gray(215)));
+}
+
+/// One line describing what happens between the file and the audio device.
+///
+/// The player always follows the device's mix format and deliberately offers no
+/// rate override: cpal drives WASAPI in *shared* mode, where Windows converts to
+/// the mix format regardless, so asking for anything else would resample twice
+/// (ours, then Windows') for strictly worse quality. This read-out makes the
+/// resulting path visible — "direct" means the track reaches the device untouched.
+pub fn output_path_summary(
+    file_rate: u32,
+    file_channels: usize,
+    device_rate: u32,
+    device_channels: usize,
+) -> String {
+    let rate = if file_rate == device_rate {
+        format!("{file_rate} Hz")
+    } else {
+        format!("{file_rate} -> {device_rate} Hz")
+    };
+
+    if file_channels != device_channels {
+        format!("{rate} - {file_channels} -> {device_channels} ch")
+    } else if file_rate == device_rate {
+        format!("{rate} - direct")
+    } else {
+        format!("{rate} - resampled")
+    }
 }
 
 fn optional_text(value: &Option<String>) -> &str {
