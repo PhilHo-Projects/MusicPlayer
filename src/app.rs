@@ -447,7 +447,7 @@ impl MusicPlayerApp {
                 ui.painter().rect_stroke(
                     rect,
                     0.0,
-                    egui::Stroke::new(1.0, Color32::from_rgb(82, 82, 82)),
+                    egui::Stroke::new(1.0_f32, Color32::from_rgb(82, 82, 82)),
                     egui::StrokeKind::Inside,
                 );
 
@@ -761,7 +761,7 @@ impl MusicPlayerApp {
                 Pos2::new(played_x, rect.top()),
                 Pos2::new(played_x, rect.bottom()),
             ],
-            Stroke::new(1.0, Color32::from_rgb(170, 210, 225)),
+            Stroke::new(1.0_f32, Color32::from_rgb(170, 210, 225)),
         );
     }
 
@@ -851,7 +851,7 @@ impl MusicPlayerApp {
                             let cy = baseline - sp(li, half_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(lx, cy), Pos2::new(lx + bw, cy)],
-                                Stroke::new(1.5, cap_color),
+                                Stroke::new(1.5_f32, cap_color),
                             );
                         }
 
@@ -874,7 +874,7 @@ impl MusicPlayerApp {
                             let cy = baseline - sp(d, half_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(rx, cy), Pos2::new(rx + bw, cy)],
-                                Stroke::new(1.5, cap_color),
+                                Stroke::new(1.5_f32, cap_color),
                             );
                         }
                     }
@@ -924,7 +924,7 @@ impl MusicPlayerApp {
                         .collect();
                     painter.add(egui::Shape::line(
                         ridge,
-                        Stroke::new(1.5, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
+                        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
                     ));
                 }
             }
@@ -958,7 +958,7 @@ impl MusicPlayerApp {
                             let cy = baseline - sp(i, display_n).clamp(0.0, 1.0) * usable;
                             painter.line_segment(
                                 [Pos2::new(x, cy), Pos2::new(x + bw, cy)],
-                                Stroke::new(1.5, cap_color),
+                                Stroke::new(1.5_f32, cap_color),
                             );
                         }
                     }
@@ -989,7 +989,7 @@ impl MusicPlayerApp {
                         .collect();
                     painter.add(egui::Shape::line(
                         pts,
-                        Stroke::new(1.5, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
+                        Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(230, 230, 230, 150)),
                     ));
                 }
             }
@@ -1018,7 +1018,7 @@ impl MusicPlayerApp {
                 Pos2::new(inset.left(), cap_y),
                 Pos2::new(inset.right(), cap_y),
             ],
-            Stroke::new(1.5, Color32::from_rgba_unmultiplied(235, 235, 235, 200)),
+            Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(235, 235, 235, 200)),
         );
 
         // Clip latch: a solid red block at the very top after a true full-scale
@@ -1035,7 +1035,7 @@ impl MusicPlayerApp {
         painter.rect_stroke(
             rect,
             3.0,
-            Stroke::new(1.0, Color32::from_rgb(64, 64, 64)),
+            Stroke::new(1.0_f32, Color32::from_rgb(64, 64, 64)),
             egui::StrokeKind::Inside,
         );
     }
