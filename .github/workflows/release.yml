@@ -30,6 +30,13 @@ jobs:
         shell: pwsh
         run: pwsh -File scripts/package.ps1
 
+      - name: Smoke test the packaged MP3 launch
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $package = Get-Item dist/MusicPlayer-*.zip
+          pwsh -File scripts/smoke-windows.ps1 -PackagePath $package.FullName
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -59,10 +66,14 @@ jobs:
           set -euo pipefail
           export MACOSX_DEPLOYMENT_TARGET=11.0
           VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [[ "${GITHUB_REF_TYPE:-}" == tag && "${GITHUB_REF_NAME:-}" != "v$VERSION" ]]; then
+            echo "Release tag ${GITHUB_REF_NAME} does not match Cargo version v$VERSION" >&2
+            exit 1
+          fi
           echo "Building MusicPlayer $VERSION (universal)"
 
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
 
           APP="MusicPlayer.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

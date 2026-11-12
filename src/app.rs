@@ -1,37 +1,50 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
-    sync::mpsc::{Receiver, TryRecvError},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{
     self, Button, Color32, ColorImage, ComboBox, Context, Layout, Mesh, Pos2, Rect, RichText,
     Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
+use symphonia::core::audio::Channels;
 
 use crate::{
     audio::{
-        AudioEngine, EQ_BANDS_HZ, EqSettings, PlaybackBuffer, PlaybackSnapshot, TransportState,
-        remix_channels, resample_interleaved,
+        AudioEngine, EQ_BANDS_HZ, EqSettings, PlaybackBuffer, PlaybackSnapshot, PlaybackState,
+        TransportState, remix_channels, remix_track_channels, resample_interleaved,
     },
-    decoder::{DecodedTrack, WAVEFORM_BINS, decode_track_unanalyzed},
-    metadata::{CoverArt, TrackInfo, read_track_info},
+    decoder::{DecodeError, DecodedTrack, WAVEFORM_BINS, decode_track_cancelable},
+    metadata::{CoverArt, TrackInfo, read_track_tags},
     spectrum::{SpectrumAnalyzer, SpectrumDisplayMode, SpectrumParams},
-    waveform::{ColorMode, ReductionMode, WaveformAnalysis, WaveformParams, analyze_waveform},
+    waveform::{
+        ColorMode, ReductionMode, WaveformAnalysis, WaveformParams, analyze_waveform_cancelable,
+    },
 };
+
+const OUTPUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct MusicPlayerApp {
     audio: Result<AudioEngine, String>,
+    suspended_playback: PlaybackState,
+    retry_audio_at: Instant,
+    pending_recovery: Option<Pending<Result<RecoveredOutput, String>>>,
     track: Option<LoadedTrack>,
     cover_texture: Option<TextureHandle>,
     status: String,
     eq_settings: EqSettings,
     waveform_params: WaveformParams,
-    pending_load: Option<Receiver<LoadOutcome>>,
+    waveform_columns: Option<WaveformColumns>,
+    track_worker: Option<Sender<TrackJob>>,
+    pending_load: Option<Pending<LoadOutcome>>,
     /// In-flight background waveform analysis for the current track.
-    pending_analysis: Option<Receiver<(u64, WaveformAnalysis)>>,
+    pending_analysis: Option<Pending<(u64, WaveformAnalysis)>>,
     analysis_gate: AnalysisGate,
     /// File-open requests forwarded from secondary launches (double-click in
     /// Explorer). `None` when single-instance IPC isn't wired up.
@@ -66,6 +79,17 @@ impl AnalysisGate {
 struct LoadedTrack {
     info: TrackInfo,
     decoded: DecodedTrack,
+}
+
+struct WaveformColumns {
+    params: WaveformParams,
+    bars: Vec<WaveformColumn>,
+}
+
+struct WaveformColumn {
+    height: f32,
+    played: Color32,
+    unplayed: Color32,
 }
 
 /// Output peak/clip meter state. `level`/`cap` are 0..=1 bar heights; `clip_latch`
@@ -109,6 +133,10 @@ impl ClipMeter {
     fn decay(&mut self, dt: f32) {
         self.update(0.0, false, dt);
     }
+
+    fn is_animating(&self) -> bool {
+        self.level > 0.0 || self.cap > 0.0 || self.clip_latch > 0.0
+    }
 }
 
 /// Result of decoding/resampling a file on a background thread.
@@ -122,7 +150,57 @@ enum LoadOutcome {
 struct LoadedData {
     info: TrackInfo,
     decoded: DecodedTrack,
+    buffer: PlaybackBuffer,
+}
+
+struct Pending<T> {
+    result: Receiver<T>,
+    canceled: Arc<AtomicBool>,
+}
+
+impl<T> Pending<T> {
+    fn channel() -> (Sender<T>, Self) {
+        let (sender, result) = mpsc::channel();
+        (
+            sender,
+            Self {
+                result,
+                canceled: Arc::default(),
+            },
+        )
+    }
+}
+
+impl<T> Drop for Pending<T> {
+    fn drop(&mut self) {
+        self.canceled.store(true, Ordering::Relaxed);
+    }
+}
+
+struct RecoveredOutput {
+    engine: AudioEngine,
     buffer: Option<PlaybackBuffer>,
+}
+
+type TrackJob = Box<dyn FnOnce() + Send>;
+
+fn start_track_worker(ctx: Context) -> std::io::Result<Sender<TrackJob>> {
+    let (sender, receiver) = mpsc::channel::<TrackJob>();
+    std::thread::Builder::new()
+        .name("track-loader".into())
+        .spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                let job = receiver.try_iter().last().unwrap_or(job);
+                job();
+                ctx.request_repaint();
+            }
+        })?;
+    Ok(sender)
+}
+
+fn open_audio(ctx: &Context) -> Result<AudioEngine, String> {
+    let wake = ctx.clone();
+    AudioEngine::with_error_wake(move || wake.request_repaint()).map_err(|error| error.to_string())
 }
 
 /// Cosmetic render settings persisted between sessions via eframe's storage
@@ -150,7 +228,7 @@ impl MusicPlayerApp {
         file_rx: Option<Receiver<PathBuf>>,
     ) -> Self {
         configure_style(&cc.egui_ctx);
-        let audio = AudioEngine::new().map_err(|error| error.to_string());
+        let audio = open_audio(&cc.egui_ctx);
         let eq_settings = audio
             .as_ref()
             .map(|engine| engine.eq_settings())
@@ -163,14 +241,24 @@ impl MusicPlayerApp {
         // Restore the spectrum/waveform render settings from the last session.
         // Missing or unreadable storage (fresh install) falls back to defaults.
         let settings = cc.storage.map(PersistedSettings::load).unwrap_or_default();
+        let status = audio
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| "Open or drop one audio file.".to_owned());
 
         let mut app = Self {
             audio,
+            suspended_playback: PlaybackState::default(),
+            retry_audio_at: Instant::now() + OUTPUT_RETRY_INTERVAL,
+            pending_recovery: None,
             track: None,
             cover_texture: None,
-            status: "Open or drop one audio file.".to_owned(),
+            status,
             eq_settings,
             waveform_params: settings.waveform,
+            waveform_columns: None,
+            track_worker: None,
             pending_load: None,
             pending_analysis: None,
             analysis_gate: AnalysisGate::default(),
@@ -182,7 +270,7 @@ impl MusicPlayerApp {
         };
 
         if let Some(path) = initial_file {
-            app.load_path(path);
+            app.load_path(path, &cc.egui_ctx);
         }
 
         app
@@ -190,7 +278,7 @@ impl MusicPlayerApp {
 
     /// Kick off decoding/resampling on a background thread so the UI never
     /// freezes while a file loads. The result is picked up in [`Self::poll_load`].
-    fn load_path(&mut self, path: PathBuf) {
+    fn load_path(&mut self, path: PathBuf, ctx: &Context) {
         let display = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -203,24 +291,51 @@ impl MusicPlayerApp {
             .ok()
             .map(|engine| (engine.output_sample_rate(), engine.output_channels()));
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-        // Drop any in-flight load: replacing the receiver means a stale result
-        // from a previous file simply fails to send and is discarded.
-        self.pending_load = Some(receiver);
+        self.pending_load = None;
+        self.pending_recovery = None;
+        match self.queue_track_work(ctx, move |canceled| {
+            load_track(path, output, || canceled.load(Ordering::Relaxed))
+        }) {
+            Ok(pending) => self.pending_load = Some(pending),
+            Err(error) => self.status = format!("Could not start file load ({error})"),
+        }
+    }
 
-        std::thread::spawn(move || {
-            let _ = sender.send(load_track(path, output));
+    fn queue_track_work<T: Send + 'static>(
+        &mut self,
+        ctx: &Context,
+        work: impl FnOnce(&AtomicBool) -> T + Send + 'static,
+    ) -> std::io::Result<Pending<T>> {
+        let (result, pending) = Pending::channel();
+        let canceled = Arc::clone(&pending.canceled);
+        let mut job: TrackJob = Box::new(move || {
+            if !canceled.load(Ordering::Relaxed) {
+                let _ = result.send(work(&canceled));
+            }
         });
+        if let Some(worker) = &self.track_worker {
+            match worker.send(job) {
+                Ok(()) => return Ok(pending),
+                Err(error) => job = error.0,
+            }
+        }
+        let worker = start_track_worker(ctx.clone())?;
+        worker
+            .send(job)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.track_worker = Some(worker);
+        Ok(pending)
     }
 
     /// Apply a finished background load, if one is ready.
     fn poll_load(&mut self, ctx: &Context) {
         let outcome = match &self.pending_load {
-            Some(receiver) => match receiver.try_recv() {
+            Some(pending) => match pending.result.try_recv() {
                 Ok(outcome) => outcome,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     self.pending_load = None;
+                    self.status = "Could not finish opening the file.".to_owned();
                     return;
                 }
             },
@@ -238,38 +353,53 @@ impl MusicPlayerApp {
                     decoded,
                     buffer,
                 } = *data;
-                if let (Ok(engine), Some(buffer)) = (&self.audio, buffer) {
-                    let buffer = Arc::new(buffer);
+                let buffer = Arc::new(buffer);
+                if let Ok(engine) = &self.audio {
                     engine.load(Arc::clone(&buffer));
                     engine.play();
-
-                    // Analysis no longer gates playback. It reads the very buffer
-                    // the engine is playing, so the track isn't duplicated, and
-                    // the result is stamped with a generation so a load started
-                    // while this one is still running can't be overwritten by it.
-                    // Note this is *post*-resample audio: identical to the decoded
-                    // samples on a rate-matched device (the normal case), and the
-                    // resampled stream otherwise - envelope-equivalent either way.
-                    let generation = self.analysis_gate.begin();
-                    let (sender, receiver) = std::sync::mpsc::channel();
-                    self.pending_analysis = Some(receiver);
-                    std::thread::spawn(move || {
-                        let analysis = analyze_waveform(
-                            &buffer.samples,
-                            buffer.channels,
-                            buffer.sample_rate,
-                            WAVEFORM_BINS,
-                        );
-                        let _ = sender.send((generation, analysis));
-                    });
+                } else {
+                    self.suspended_playback.load(Arc::clone(&buffer));
+                    self.suspended_playback.play();
                 }
+                self.start_waveform_analysis(ctx, buffer);
                 self.cover_texture = info
                     .cover_art
                     .as_ref()
                     .and_then(|cover| texture_from_cover(ctx, cover));
-                self.status = format!("Loaded {}", info.title);
+                self.status = self
+                    .audio
+                    .as_ref()
+                    .err()
+                    .cloned()
+                    .unwrap_or_else(|| format!("Loaded {}", info.title));
                 self.track = Some(LoadedTrack { info, decoded });
+                self.waveform_columns = None;
             }
+        }
+    }
+
+    fn start_waveform_analysis(&mut self, ctx: &Context, buffer: Arc<PlaybackBuffer>) {
+        let generation = self.analysis_gate.begin();
+        let (sender, pending) = Pending::channel();
+        let canceled = Arc::clone(&pending.canceled);
+        let wake = ctx.clone();
+        self.pending_analysis = None;
+        let worker = std::thread::Builder::new()
+            .name("waveform-analysis".into())
+            .spawn(move || {
+                if let Some(analysis) = analyze_waveform_cancelable(
+                    &buffer.samples,
+                    buffer.channels,
+                    buffer.sample_rate,
+                    WAVEFORM_BINS,
+                    || canceled.load(Ordering::Relaxed),
+                ) {
+                    let _ = sender.send((generation, analysis));
+                    wake.request_repaint();
+                }
+            });
+        if worker.is_ok() {
+            self.pending_analysis = Some(pending);
         }
     }
 
@@ -277,21 +407,128 @@ impl MusicPlayerApp {
     /// from a superseded load is dropped rather than painted onto the track that
     /// replaced it.
     fn poll_analysis(&mut self) {
-        let Some(receiver) = &self.pending_analysis else {
+        let Some(pending) = &self.pending_analysis else {
             return;
         };
-        match receiver.try_recv() {
+        match pending.result.try_recv() {
             Ok((generation, analysis)) => {
                 self.pending_analysis = None;
                 if self.analysis_gate.accepts(generation)
                     && let Some(track) = &mut self.track
                 {
                     track.decoded.waveform = analysis;
+                    self.waveform_columns = None;
                 }
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => self.pending_analysis = None,
         }
+    }
+
+    fn poll_audio_error(&mut self) {
+        if let Ok(engine) = &self.audio
+            && let Some(error) = engine.take_output_error()
+        {
+            self.suspended_playback = engine.suspend_playback();
+            let status = format!("Audio output disconnected ({error})");
+            if self.pending_load.is_none() {
+                self.status.clone_from(&status);
+            }
+            self.audio = Err(status);
+            self.spectrum = None;
+            self.retry_audio_at = Instant::now();
+        }
+    }
+
+    fn poll_audio_recovery(&mut self, ctx: &Context) {
+        if self.audio.is_ok() || self.pending_load.is_some() {
+            return;
+        }
+
+        if let Some(pending) = &self.pending_recovery {
+            let result = match pending.result.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    Err("Could not restart audio output.".to_owned())
+                }
+            };
+            self.pending_recovery = None;
+            match result {
+                Ok(output) if output.engine.take_output_error().is_none() => {
+                    self.restore_audio(ctx, output);
+                    return;
+                }
+                Ok(_) => self.update_audio_error("Audio output disconnected.".to_owned()),
+                Err(error) => self.update_audio_error(error),
+            }
+            self.retry_audio_at = Instant::now() + OUTPUT_RETRY_INTERVAL;
+        }
+
+        let delay = self
+            .retry_audio_at
+            .saturating_duration_since(Instant::now());
+        if !delay.is_zero() {
+            ctx.request_repaint_after(delay);
+            return;
+        }
+
+        let wake = ctx.clone();
+        let buffer = self.suspended_playback.track();
+        let source = self.track.as_ref().map(|track| track.info.path.clone());
+        let layout = self
+            .track
+            .as_ref()
+            .zip(buffer.as_ref())
+            .filter(|(track, buffer)| track.decoded.channels == buffer.channels)
+            .and_then(|(track, _)| track.decoded.channel_layout.clone());
+        match self.queue_track_work(ctx, move |canceled| {
+            let engine = open_audio(&wake)?;
+            let buffer = match buffer {
+                Some(buffer) => recovery_buffer(
+                    &buffer,
+                    source.as_deref(),
+                    layout.as_ref(),
+                    (engine.output_sample_rate(), engine.output_channels()),
+                    || canceled.load(Ordering::Relaxed),
+                )?,
+                None => None,
+            };
+            Ok(RecoveredOutput { engine, buffer })
+        }) {
+            Ok(pending) => self.pending_recovery = Some(pending),
+            Err(error) => {
+                self.update_audio_error(format!("Could not restart audio output ({error})"));
+                self.retry_audio_at = Instant::now() + OUTPUT_RETRY_INTERVAL;
+                ctx.request_repaint_after(OUTPUT_RETRY_INTERVAL);
+            }
+        }
+    }
+
+    fn update_audio_error(&mut self, error: String) {
+        if self.audio.as_ref().err() == Some(&self.status) {
+            self.status.clone_from(&error);
+        }
+        self.audio = Err(error);
+    }
+
+    fn restore_audio(&mut self, ctx: &Context, output: RecoveredOutput) {
+        let RecoveredOutput { engine, buffer } = output;
+        if let Some(buffer) = buffer {
+            let buffer = Arc::new(buffer);
+            self.suspended_playback.replace_buffer(Arc::clone(&buffer));
+            self.start_waveform_analysis(ctx, buffer);
+        }
+        engine.set_eq_settings(self.eq_settings);
+        engine.restore_playback(std::mem::take(&mut self.suspended_playback));
+        self.spectrum = Some(SpectrumAnalyzer::new(engine.output_sample_rate()));
+        if self.audio.as_ref().err() == Some(&self.status) {
+            self.status = match &self.track {
+                Some(track) => format!("Loaded {}", track.info.title),
+                None => "Open or drop one audio file.".to_owned(),
+            };
+        }
+        self.audio = Ok(engine);
     }
 
     /// Load a file forwarded from a secondary launch (double-click in Explorer)
@@ -309,50 +546,57 @@ impl MusicPlayerApp {
             None => None,
         };
         if let Some(path) = latest {
-            self.load_path(path);
+            self.load_path(path, ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
-    fn open_file_dialog(&mut self) {
+    fn open_file_dialog(&mut self, ctx: &Context) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Open audio file")
             .add_filter("Audio", &["mp3", "wav", "flac", "m4a", "aac"])
             .pick_file()
         {
-            self.load_path(path);
+            self.load_path(path, ctx);
         }
     }
 
     fn snapshot(&self) -> PlaybackSnapshot {
-        self.audio.as_ref().map_or(
-            PlaybackSnapshot {
-                transport: TransportState::Stopped,
-                position_seconds: 0.0,
-                duration: Duration::ZERO,
-                volume: 1.0,
-                has_track: false,
-            },
-            |engine| engine.snapshot(),
+        self.audio.as_ref().map_or_else(
+            |_| self.suspended_playback.snapshot(),
+            AudioEngine::snapshot,
         )
     }
 
     fn handle_dropped_files(&mut self, ctx: &Context) {
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         if let Some(file) = dropped.into_iter().find_map(|file| file.path) {
-            self.load_path(file);
+            self.load_path(file, ctx);
         }
     }
 }
 
 impl eframe::App for MusicPlayerApp {
+    fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.poll_audio_error();
+        // eframe runs logic even for a minimized window when IPC requests a repaint.
+        self.poll_file_requests(ctx);
+        self.handle_dropped_files(ctx);
+        self.poll_load(ctx);
+        self.poll_analysis();
+        self.poll_audio_recovery(ctx);
+        if self.pending_load.is_some()
+            || self.pending_analysis.is_some()
+            || self.pending_recovery.is_some()
+        {
+            // Check for a disconnected worker even if it could not request a repaint.
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.handle_dropped_files(&ctx);
-        self.poll_file_requests(&ctx);
-        self.poll_load(&ctx);
-        self.poll_analysis();
         let dt = ctx.input(|input| input.stable_dt).clamp(0.0, 0.1);
         self.update_visualizers(dt);
 
@@ -363,7 +607,7 @@ impl eframe::App for MusicPlayerApp {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("MusicPlayer").strong().color(Color32::WHITE));
                     if ui.button("Open").clicked() {
-                        self.open_file_dialog();
+                        self.open_file_dialog(&ctx);
                     }
                     ui.add_space(8.0);
                     ui.label(RichText::new(&self.status).color(Color32::from_gray(170)));
@@ -411,7 +655,15 @@ impl eframe::App for MusicPlayerApp {
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(28, 28, 28)))
             .show_inside(ui, |ui| self.show_album_area(ui));
 
-        ctx.request_repaint_after(Duration::from_millis(33));
+        if (self.audio.is_ok() && self.snapshot().transport == TransportState::Playing)
+            || self.clip_meter.is_animating()
+            || self
+                .spectrum
+                .as_ref()
+                .is_some_and(SpectrumAnalyzer::is_animating)
+        {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
     }
 
     /// Persist the cosmetic render settings. eframe calls this on shutdown and
@@ -571,9 +823,12 @@ impl MusicPlayerApp {
                     if ui
                         .add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false))
                         .changed()
-                        && let Ok(engine) = &self.audio
                     {
-                        engine.set_volume(volume);
+                        if let Ok(engine) = &self.audio {
+                            engine.set_volume(volume);
+                        } else {
+                            self.suspended_playback.set_volume(volume);
+                        }
                     }
 
                     ui.add_space(14.0);
@@ -641,7 +896,13 @@ impl MusicPlayerApp {
         }
     }
 
-    fn paint_waveform(&self, ui: &egui::Ui, rect: Rect, position_seconds: f32, duration: Duration) {
+    fn paint_waveform(
+        &mut self,
+        ui: &egui::Ui,
+        rect: Rect,
+        position_seconds: f32,
+        duration: Duration,
+    ) {
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, Color32::from_rgb(19, 19, 19));
 
@@ -658,12 +919,15 @@ impl MusicPlayerApp {
 
         let analysis = &track.decoded.waveform;
         if analysis.is_empty() {
-            // The track is already playing at this point - the waveform is still
-            // being analyzed on a background thread.
+            let status = if self.pending_analysis.is_some() {
+                "Analyzing waveform\u{2026}"
+            } else {
+                "Waveform unavailable"
+            };
             painter.text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Analyzing waveform\u{2026}",
+                status,
                 egui::TextStyle::Button.resolve(ui.style()),
                 Color32::from_gray(120),
             );
@@ -671,8 +935,7 @@ impl MusicPlayerApp {
         }
 
         let params = self.waveform_params;
-        let amplitude = analysis.amplitude(params.mode);
-        let bin_count = amplitude.len();
+        let bin_count = analysis.len();
 
         let progress = if duration > Duration::ZERO {
             (position_seconds / duration.as_secs_f32()).clamp(0.0, 1.0)
@@ -694,55 +957,26 @@ impl MusicPlayerApp {
             .max(1);
         let spectral = params.color_mode == ColorMode::Spectral && track.info.traktor_analyzed;
 
-        let mut column_amp = vec![0.0_f32; columns];
-        let mut column_rgb = vec![(0.0_f32, 0.0_f32, 0.0_f32); columns];
-        for column in 0..columns {
-            let start = column * bin_count / columns;
-            let end = ((column + 1) * bin_count / columns)
-                .max(start + 1)
-                .min(bin_count);
-            column_amp[column] = match params.mode {
-                ReductionMode::Peak => amplitude[start..end].iter().copied().fold(0.0, f32::max),
-                ReductionMode::Rms => {
-                    let energy: f32 = amplitude[start..end]
-                        .iter()
-                        .map(|value| value * value)
-                        .sum();
-                    (energy / (end - start) as f32).sqrt()
-                }
-            };
-            if spectral {
-                let mut low = 0.0_f32;
-                let mut mid = 0.0_f32;
-                let mut high = 0.0_f32;
-                for index in start..end {
-                    low = low.max(analysis.low[index]);
-                    mid = mid.max(analysis.mid[index]);
-                    high = high.max(analysis.high[index]);
-                }
-                column_rgb[column] = (low, mid, high);
-            }
+        if self
+            .waveform_columns
+            .as_ref()
+            .is_some_and(|cache| cache.params != params || cache.bars.len() != columns)
+        {
+            self.waveform_columns = None;
         }
-        if params.smoothing > 0 {
-            column_amp = smooth(&column_amp, params.smoothing);
-        }
+        let cache = self
+            .waveform_columns
+            .get_or_insert_with(|| WaveformColumns::new(analysis, params, columns, spectral));
 
         let slot = width / columns as f32;
         let bar_width = (slot - 1.0).clamp(1.0, slot.max(1.0));
-        for column in 0..columns {
-            let shaped = column_amp[column].clamp(0.0, 1.0).powf(params.gamma);
-            let height = (shaped * half_height * params.height_scale)
-                .clamp(0.0, half_height)
-                .max(0.5);
+        for (column, bar) in cache.bars.iter().enumerate() {
+            let height = (bar.height * half_height).max(0.5);
             let x = rect.left() + (column as f32 + 0.5) * slot;
-            let played = x <= played_x;
-            let color = if spectral {
-                let (low, mid, high) = column_rgb[column];
-                spectral_color(low, mid, high, played)
-            } else if played {
-                Color32::from_rgb(96, 158, 184)
+            let color = if x <= played_x {
+                bar.played
             } else {
-                Color32::from_rgb(72, 78, 84)
+                bar.unplayed
             };
 
             let (top, bottom) = if params.mirror {
@@ -766,13 +1000,10 @@ impl MusicPlayerApp {
     }
 
     /// Feed the audio tap into the spectrum + clip meter, or ease them down when
-    /// nothing is playing. Both are no-ops without an audio engine.
+    /// nothing is playing.
     fn update_visualizers(&mut self, dt: f32) {
         let playing = matches!(self.snapshot().transport, TransportState::Playing);
-        let Ok(engine) = &self.audio else {
-            return;
-        };
-        if playing {
+        if playing && let Ok(engine) = &self.audio {
             let levels = engine.drain_viz(&mut self.viz_samples);
             let params = self.spectrum_params;
             if let Some(spectrum) = &mut self.spectrum {
@@ -1179,40 +1410,102 @@ impl MusicPlayerApp {
     }
 }
 
+impl WaveformColumns {
+    fn new(
+        analysis: &WaveformAnalysis,
+        params: WaveformParams,
+        columns: usize,
+        spectral: bool,
+    ) -> Self {
+        let amplitude = analysis.amplitude(params.mode);
+        let mut amplitudes = Vec::with_capacity(columns);
+        let mut bars = Vec::with_capacity(columns);
+        for column in 0..columns {
+            let start = column * amplitude.len() / columns;
+            let end = (column + 1) * amplitude.len() / columns;
+            let values = &amplitude[start..end];
+            let level = match params.mode {
+                ReductionMode::Peak => values.iter().copied().fold(0.0, f32::max),
+                ReductionMode::Rms => {
+                    let power: f32 = values.iter().map(|value| value * value).sum();
+                    (power / values.len() as f32).sqrt()
+                }
+            };
+            let (played, unplayed) = if spectral {
+                let low = analysis.low[start..end].iter().copied().fold(0.0, f32::max);
+                let mid = analysis.mid[start..end].iter().copied().fold(0.0, f32::max);
+                let high = analysis.high[start..end]
+                    .iter()
+                    .copied()
+                    .fold(0.0, f32::max);
+                (
+                    spectral_color(low, mid, high, true),
+                    spectral_color(low, mid, high, false),
+                )
+            } else {
+                (
+                    Color32::from_rgb(96, 158, 184),
+                    Color32::from_rgb(72, 78, 84),
+                )
+            };
+            amplitudes.push(level);
+            bars.push(WaveformColumn {
+                height: 0.0,
+                played,
+                unplayed,
+            });
+        }
+        if params.smoothing > 0 {
+            amplitudes = smooth(&amplitudes, params.smoothing);
+        }
+        for (bar, amplitude) in bars.iter_mut().zip(amplitudes) {
+            bar.height = (amplitude.clamp(0.0, 1.0).powf(params.gamma) * params.height_scale)
+                .clamp(0.0, 1.0);
+        }
+        Self { params, bars }
+    }
+}
+
 /// Runs on a worker thread: decode, read tags, and resample into a buffer
 /// matching the audio device. `output` is the device's `(sample_rate, channels)`,
 /// or `None` when no audio engine is available (metadata/waveform only).
-fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
-    let mut decoded = match decode_track_unanalyzed(&path) {
+fn load_track(
+    path: PathBuf,
+    output: Option<(u32, usize)>,
+    canceled: impl Fn() -> bool,
+) -> LoadOutcome {
+    let mut decoded = match decode_track_cancelable(&path, &canceled) {
         Ok(decoded) => decoded,
         Err(error) => return LoadOutcome::Failed(error.to_string()),
     };
 
-    let mut info = read_track_info(&path).unwrap_or_else(|_| TrackInfo::fallback(path.clone()));
+    if canceled() {
+        return LoadOutcome::Failed(DecodeError::Canceled.to_string());
+    }
+    let mut info = read_track_tags(&path).unwrap_or_else(|_| TrackInfo::fallback(path.clone()));
     info.duration = Some(decoded.duration);
     info.sample_rate = Some(decoded.sample_rate);
     info.channels = Some(decoded.channels as u16);
 
-    // The raw samples feed the playback buffer and nothing else — the waveform
-    // analysis is already baked. Move them out so the `DecodedTrack` we retain
-    // for the rest of the session isn't holding a second full copy of the track
-    // (>2 GB on a two-hour set).
+    if canceled() {
+        return LoadOutcome::Failed(DecodeError::Canceled.to_string());
+    }
+    // Playback and waveform analysis share a single owned sample buffer.
     let samples = std::mem::take(&mut decoded.samples);
 
     let buffer = match output {
-        Some((sample_rate, channels)) => {
+        Some(output) => {
             match prepare_playback_buffer(
                 samples,
-                decoded.channels,
-                decoded.sample_rate,
-                sample_rate,
-                channels,
+                (decoded.sample_rate, decoded.channels),
+                decoded.channel_layout.as_ref(),
+                output,
             ) {
-                Ok(buffer) => Some(buffer),
+                Ok(buffer) => buffer,
                 Err(error) => return LoadOutcome::Failed(error.to_string()),
             }
         }
-        None => None,
+        None => PlaybackBuffer::new(samples, decoded.sample_rate, decoded.channels),
     };
 
     LoadOutcome::Loaded(Box::new(LoadedData {
@@ -1222,17 +1515,56 @@ fn load_track(path: PathBuf, output: Option<(u32, usize)>) -> LoadOutcome {
     }))
 }
 
+fn recovery_buffer(
+    buffer: &PlaybackBuffer,
+    source: Option<&Path>,
+    layout: Option<&Channels>,
+    output: (u32, usize),
+    canceled: impl Fn() -> bool,
+) -> Result<Option<PlaybackBuffer>, String> {
+    let input = (buffer.sample_rate, buffer.channels);
+    if input == output {
+        return Ok(None);
+    }
+
+    // Reuse the source file on format changes so switching devices repeatedly
+    // doesn't accumulate resampling or downmix losses. The loaded PCM is the
+    // fallback for tracks opened from a drive that has since been disconnected.
+    let decoded = source.and_then(|path| decode_track_cancelable(path, &canceled).ok());
+    if canceled() {
+        return Err(DecodeError::Canceled.to_string());
+    }
+    let converted = if let Some(decoded) = decoded {
+        prepare_playback_buffer(
+            decoded.samples,
+            (decoded.sample_rate, decoded.channels),
+            decoded.channel_layout.as_ref(),
+            output,
+        )
+    } else {
+        prepare_playback_buffer(buffer.samples.clone(), input, layout, output)
+    };
+    converted.map(Some).map_err(|error| error.to_string())
+}
+
 /// Consumes the decoded samples: when the device already matches the file's rate
 /// and layout both steps hand the same allocation through, so a matching device
 /// costs no extra copy of the track at all.
 fn prepare_playback_buffer(
     samples: Vec<f32>,
-    channels: usize,
-    sample_rate: u32,
-    output_sample_rate: u32,
-    output_channels: usize,
+    (input_sample_rate, input_channels): (u32, usize),
+    layout: Option<&Channels>,
+    (output_sample_rate, output_channels): (u32, usize),
 ) -> Result<PlaybackBuffer, crate::audio::AudioProcessError> {
-    let resampled = resample_interleaved(samples, channels, sample_rate, output_sample_rate)?;
+    // Perform the rate conversion with the smaller channel count. Expanding
+    // early would resample channels that only contain copies or silence.
+    let (samples, channels) = if output_channels < input_channels {
+        let downmixed = remix_track_channels(samples, input_channels, layout, output_channels);
+        (downmixed, output_channels)
+    } else {
+        (samples, input_channels)
+    };
+    let resampled = resample_interleaved(samples, channels, input_sample_rate, output_sample_rate)?;
     let remixed = remix_channels(resampled, channels, output_channels);
     Ok(PlaybackBuffer::new(
         remixed,
@@ -1253,7 +1585,12 @@ fn configure_style(ctx: &Context) {
 }
 
 fn texture_from_cover(ctx: &Context, cover: &CoverArt) -> Option<TextureHandle> {
-    if cover.rgba.is_empty() || cover.width == 0 || cover.height == 0 {
+    let max_side = ctx.input(|input| input.max_texture_side);
+    if cover.rgba.is_empty()
+        || cover.width == 0
+        || cover.height == 0
+        || cover.width.max(cover.height) as usize > max_side
+    {
         return None;
     }
 
@@ -1360,7 +1697,7 @@ fn smooth(values: &[f32], radius: usize) -> Vec<f32> {
     (0..len)
         .map(|index| {
             let start = index.saturating_sub(radius);
-            let end = (index + radius + 1).min(len);
+            let end = index.saturating_add(radius).saturating_add(1).min(len);
             let sum: f32 = values[start..end].iter().sum();
             sum / (end - start) as f32
         })
@@ -1473,5 +1810,98 @@ fn path_from_os(value: OsString) -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_to_matching_output_reuses_the_playback_buffer() {
+        let buffer = PlaybackBuffer::new(vec![0.5, 0.25], 44_100, 2);
+
+        assert!(
+            recovery_buffer(&buffer, None, None, (44_100, 2), || false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reconnect_can_convert_retained_audio_when_the_source_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("removed.wav");
+        let buffer = PlaybackBuffer::new(vec![0.5; 441], 44_100, 1);
+
+        let converted = recovery_buffer(&buffer, Some(&path), None, (48_000, 2), || false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(converted.sample_rate, 48_000);
+        assert_eq!(converted.channels, 2);
+        assert!(converted.frame_count().abs_diff(480) <= 1);
+        assert!(
+            converted
+                .samples
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|frame| frame[0] == frame[1])
+        );
+    }
+
+    #[test]
+    fn load_without_an_output_device_keeps_samples_for_the_waveform() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device unavailable.wav");
+        std::fs::write(
+            &path,
+            b"RIFF\x28\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x44\xac\0\0\x88\x58\x01\0\x02\0\x10\0data\x04\0\0\0\0\x20\0\x40",
+        )
+        .unwrap();
+        let LoadOutcome::Loaded(data) = load_track(path, None, || false) else {
+            panic!("valid file should load even without an audio device");
+        };
+        assert_eq!(data.buffer.samples, [0.25, 0.5]);
+    }
+
+    #[test]
+    fn opening_a_surround_wav_preserves_center_audio_on_stereo_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("surround.wav");
+        let mut wave = b"RIFF".to_vec();
+        wave.extend(72_u32.to_le_bytes());
+        wave.extend(b"WAVEfmt ");
+        wave.extend(40_u32.to_le_bytes());
+        wave.extend(0xfffe_u16.to_le_bytes()); // WAVE_FORMAT_EXTENSIBLE
+        wave.extend(6_u16.to_le_bytes());
+        wave.extend(44_100_u32.to_le_bytes());
+        wave.extend(529_200_u32.to_le_bytes());
+        wave.extend(12_u16.to_le_bytes());
+        wave.extend(16_u16.to_le_bytes());
+        wave.extend(22_u16.to_le_bytes());
+        wave.extend(16_u16.to_le_bytes());
+        wave.extend(0x3f_u32.to_le_bytes()); // FL, FR, FC, LFE, rear left and right
+        wave.extend([
+            1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+        ]);
+        wave.extend(b"data");
+        wave.extend(12_u32.to_le_bytes());
+        wave.extend(
+            [0_i16, 0, 16_384, 0, 0, 0]
+                .into_iter()
+                .flat_map(i16::to_le_bytes),
+        );
+        std::fs::write(&path, wave).unwrap();
+
+        let LoadOutcome::Loaded(data) = load_track(path, Some((44_100, 2)), || false) else {
+            panic!("surround WAV should load");
+        };
+        let [left, right] = data.buffer.samples[..] else {
+            panic!("expected one stereo frame");
+        };
+        assert!(left > 0.1, "center channel was lost");
+        assert_eq!(left, right);
     }
 }

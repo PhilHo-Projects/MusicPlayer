@@ -10,8 +10,9 @@ is analyzed in Traktor. See `README.md` for the feature list.
 ## Repository & CI
 
 - GitHub: <https://github.com/PhilHo-Projects/MusicPlayer.git> (org `PhilHo-Projects`).
-- `.github/workflows/ci.yml` — fmt check, clippy (`-D warnings`), test, release
-  build on push/PR (Windows runner).
+- `.github/workflows/ci.yml` runs fmt, Clippy, locked tests and locked release
+  builds on Windows and macOS. Windows also checks MP3 startup and forwarding
+  with the standalone ZIP.
 - `.github/workflows/release.yml` — on a `vX.Y.Z` tag, builds the standalone
   **Windows** exe (`scripts\package.ps1`) and a universal **macOS** `.app`
   (unsigned) and attaches both to a GitHub Release. To cut a release: bump
@@ -65,11 +66,11 @@ Always confirm an API against the crate source in
   **off**, so *only* those two param sets persist, not window geometry / panel
   layout. EQ isn't persisted (it lives in the audio engine). "Reset" just sets
   defaults, which `save` then writes — so reset-then-close defaults the next launch.
-  **Loading is two-stage**: the load thread decodes and hands the engine an
-  `Arc<PlaybackBuffer>`, playback starts immediately, then a second thread
-  analyzes *that same Arc* (so the track is never duplicated) and posts the
-  waveform back via `poll_analysis`. Results carry an `AnalysisGate` generation
-  so a superseded load can't paint its waveform onto the track that replaced it.
+  **Loading is two-stage.** A single worker coalesces queued file opens and
+  cancels superseded decodes. The app gives the engine an `Arc<PlaybackBuffer>`
+  to start playback. A second thread analyzes that same buffer and posts its
+  waveform via `poll_analysis`. Replacing a track cancels the old analysis.
+  Without audio output the analyzer works on the decoded samples directly.
   On a rate-matched device that post-resample analysis is byte-identical to
   analyzing the decoded samples — pinned by a test in `decode_tests`.
 - `audio.rs` — `AudioEngine` (cpal stream + `Arc<Mutex<EngineShared>>`),
@@ -87,6 +88,9 @@ Always confirm an API against the crate source in
   tests in `audio_processing_tests` pin this via pointer identity.
   The app follows the device's mix format and offers **no rate override**: cpal
   drives WASAPI in shared mode only, so anything else would resample twice.
+  On a stream failure, the app holds the playback buffer and cursor while the
+  track worker retries audio. Matching output formats reuse the buffer. For a
+  changed format the worker reopens the source, with the held PCM as a fallback.
 - `spectrum.rs` — `SpectrumAnalyzer`: one `realfft` pass per frame over the tapped
   output → log-spaced bars + peak-hold caps. Purely cosmetic (like `WaveformParams`).
 - `decoder.rs` — `decode_track_unanalyzed` → `DecodedTrack` with an empty
@@ -94,15 +98,16 @@ Always confirm an API against the crate source in
   unanalyzed form so playback can start before the waveform exists.
 - `metadata.rs` — `read_track_info` via `lofty`; BPM/key/Traktor fields.
 - `waveform.rs` — analysis + render params (see below).
-- `single_instance.rs` — loopback-socket guard: a second launch (double-clicking
-  a file) forwards its path to the running window and exits, rather than opening a
-  new window. `main.rs` calls `acquire`/`serve`; the UI polls the receiver.
+- `single_instance.rs` holds a per-user file lock and binds a system-assigned
+  loopback port. Both launches prove they have the endpoint record before the
+  secondary sends the path, and the primary acknowledges queueing it. A launch
+  opens its own window if the handoff fails. The UI reads forwarded paths from
+  the receiver returned by `FileRequests::attach`.
 
 ## Key facts (verified against the fixture)
 
-- **Traktor signature**: an ID3 `PRIV` frame whose owner is `TRAKTOR4`. Detected by
-  scanning the leading ID3v2 tag for the bytes `TRAKTOR` (`metadata::detect_traktor`).
-  This is the gate for spectral coloring and bar jumps.
+- **Traktor signature.** Lofty reads ID3 `PRIV` frames and checks the owner
+  `TRAKTOR4` for spectral coloring and bar jumps.
 - **Key**: ID3 `TKEY`, in Traktor's Open-Key notation (e.g. `4m`). Shown verbatim.
 - **BPM**: ID3 `TBPM` (`ItemKey::IntegerBpm`). Bar jumps are *relative* (need only
   BPM): `bars * 4 beats * 60 / bpm` seconds. The `PRIV:TRAKTOR4` payload also holds
@@ -115,8 +120,8 @@ Two layers, kept separate on purpose:
 
 1. **Analysis** (`WaveformAnalysis`, baked once by `analyze_waveform` on a
    background thread just after playback starts):
-   `peak`, `rms`, and `low`/`mid`/`high` band energies (biquad LP 250 / BP 900 /
-   HP 4000 over a mono mixdown). Amplitude-accurate; never mutated by the UI.
+   `peak`, per-channel-power `rms`, and `low`/`mid`/`high` band energies
+   (biquad LP 250 / BP 900 / HP 4000 over a mono mixdown).
 2. **Render params** (`WaveformParams`, live in `app.rs`): bars, reduction
    (Peak/RMS), gamma, height, smoothing, mirror, color mode. Applied per frame in
    `paint_waveform`.

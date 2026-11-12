@@ -1,11 +1,15 @@
 use std::{
+    sync::mpsc::{self, Receiver},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use biquad::{Biquad, Coefficients, DirectForm1, Q_BUTTERWORTH_F32, ToHertz, Type};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rubato::{Fft, FixedSync, Resampler, audioadapter_buffers::direct::InterleavedSlice};
+use rubato::{
+    Fft, FixedSync, Resampler, WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
+};
+use symphonia::core::audio::{ChannelLabel, Channels, Position};
 
 pub const EQ_BANDS_HZ: [f32; 10] = [
     31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
@@ -85,7 +89,7 @@ impl EqProcessor {
     }
 
     pub fn process_frame(&mut self, frame: &mut [f32]) {
-        if !self.settings.enabled() {
+        if self.filters.is_empty() {
             return;
         }
 
@@ -101,14 +105,19 @@ impl EqProcessor {
     }
 
     fn rebuild_filters(&mut self) {
+        if !self.settings.enabled() || self.settings.gains_db().iter().all(|&gain| gain == 0.0) {
+            self.filters.clear();
+            return;
+        }
         let safe_sample_rate = self.sample_rate.max(1) as f32;
         self.filters = (0..self.channels)
             .map(|_| {
                 EQ_BANDS_HZ
                     .iter()
                     .zip(self.settings.gains_db().iter())
+                    .filter(|(_, gain)| **gain != 0.0)
                     .filter_map(|(frequency, gain)| {
-                        let frequency = frequency.clamp(1.0, safe_sample_rate * 0.45);
+                        let frequency = frequency.min(safe_sample_rate * 0.45);
                         Coefficients::<f32>::from_params(
                             Type::PeakingEQ(*gain),
                             safe_sample_rate.hz(),
@@ -136,7 +145,7 @@ pub enum AudioProcessError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioEngineError {
-    #[error("No default Windows output device is available")]
+    #[error("No default audio output device is available")]
     NoOutputDevice,
     #[error("Audio output error: {0}")]
     Cpal(#[from] cpal::Error),
@@ -206,6 +215,20 @@ impl PlaybackState {
         self.transport = TransportState::Stopped;
     }
 
+    pub(crate) fn replace_buffer(&mut self, buffer: Arc<PlaybackBuffer>) {
+        if let Some(previous) = &self.track {
+            let frames = buffer.frame_count();
+            if self.cursor_frame >= previous.frame_count() {
+                self.cursor_frame = frames;
+            } else if previous.sample_rate != 0 {
+                let rate = u128::from(previous.sample_rate);
+                let scaled = self.cursor_frame as u128 * u128::from(buffer.sample_rate);
+                self.cursor_frame = ((scaled + rate / 2) / rate).min(frames as u128) as usize;
+            }
+        }
+        self.track = Some(buffer);
+    }
+
     pub fn clear(&mut self) {
         self.track = None;
         self.cursor_frame = 0;
@@ -213,9 +236,15 @@ impl PlaybackState {
     }
 
     pub fn play(&mut self) {
-        if self.track.is_some() {
-            self.transport = TransportState::Playing;
+        let Some(track) = &self.track else { return };
+        let frames = track.frame_count();
+        if frames == 0 {
+            return;
         }
+        if self.cursor_frame >= frames {
+            self.cursor_frame = 0;
+        }
+        self.transport = TransportState::Playing;
     }
 
     pub fn pause(&mut self) {
@@ -299,6 +328,16 @@ impl PlaybackState {
             .unwrap_or(0);
         self.cursor_frame = cursor_frame.min(max_frame);
     }
+
+    pub(crate) fn snapshot(&self) -> PlaybackSnapshot {
+        PlaybackSnapshot {
+            transport: self.transport(),
+            position_seconds: self.position_seconds(),
+            duration: self.duration(),
+            volume: self.volume(),
+            has_track: self.track.is_some(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -374,6 +413,7 @@ struct EngineShared {
     eq_processor: EqProcessor,
     output_channels: usize,
     viz: VizTap,
+    conversion_scratch: Vec<f32>,
 }
 
 impl EngineShared {
@@ -385,21 +425,12 @@ impl EngineShared {
             eq_processor: EqProcessor::new(sample_rate, output_channels, eq_settings),
             output_channels,
             viz: VizTap::new(),
-        }
-    }
-
-    fn snapshot(&self) -> PlaybackSnapshot {
-        PlaybackSnapshot {
-            transport: self.playback.transport(),
-            position_seconds: self.playback.position_seconds(),
-            duration: self.playback.duration(),
-            volume: self.playback.volume(),
-            has_track: self.playback.track.is_some(),
+            conversion_scratch: Vec::new(),
         }
     }
 
     fn write_output(&mut self, output: &mut [f32]) {
-        let Some(track) = self.playback.track.clone() else {
+        let Some(track) = self.playback.track.as_ref() else {
             output.fill(0.0);
             return;
         };
@@ -411,38 +442,34 @@ impl EngineShared {
 
         let channels = self.output_channels;
         let gain = self.playback.gain();
-        let mut frame = vec![0.0_f32; channels];
+        let frame_count = track.frame_count();
 
         for output_frame in output.chunks_mut(channels) {
-            if self.playback.cursor_frame >= track.frame_count() {
+            if self.playback.cursor_frame >= frame_count {
                 self.playback.transport = TransportState::Stopped;
-                self.playback.cursor_frame = track.frame_count();
+                self.playback.cursor_frame = frame_count;
                 output_frame.fill(0.0);
                 continue;
             }
 
             let offset = self.playback.cursor_frame * channels;
-            for (channel, sample) in frame.iter_mut().enumerate().take(channels) {
+            for (channel, sample) in output_frame.iter_mut().enumerate() {
                 *sample = track.samples[offset + channel] * gain;
             }
 
-            self.eq_processor.update_settings(self.eq_settings);
-            self.eq_processor.process_frame(&mut frame);
+            self.eq_processor.process_frame(output_frame);
 
             // Visualization tap: mono mix plus the frame's peak, captured here so
             // it reflects the EQ/gain but *not* the clamp below — that's what lets
             // the clip meter see an over-boosted band push past full scale.
             let mut mono = 0.0_f32;
             let mut frame_peak = 0.0_f32;
-            for &sample in frame.iter().take(channels) {
-                mono += sample;
+            for sample in output_frame {
+                mono += *sample;
                 frame_peak = frame_peak.max(sample.abs());
+                *sample = sample.clamp(-1.0, 1.0);
             }
             self.viz.push(mono / channels as f32, frame_peak);
-
-            for (sample, processed) in output_frame.iter_mut().zip(frame.iter()) {
-                *sample = processed.clamp(-1.0, 1.0);
-            }
 
             self.playback.cursor_frame += 1;
         }
@@ -454,10 +481,17 @@ pub struct AudioEngine {
     _stream: cpal::Stream,
     output_sample_rate: u32,
     output_channels: usize,
+    output_errors: Receiver<cpal::Error>,
 }
 
 impl AudioEngine {
     pub fn new() -> Result<Self, AudioEngineError> {
+        Self::with_error_wake(|| {})
+    }
+
+    pub(crate) fn with_error_wake(
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self, AudioEngineError> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -472,7 +506,21 @@ impl AudioEngine {
             output_channels,
         )));
 
-        let error_callback = |error| eprintln!("audio stream error: {error}");
+        let (output_error_tx, output_errors) = mpsc::sync_channel(1);
+        let error_callback = move |error: cpal::Error| {
+            eprintln!("audio stream error: {error}");
+            if matches!(
+                error.kind(),
+                cpal::ErrorKind::DeviceBusy
+                    | cpal::ErrorKind::DeviceNotAvailable
+                    | cpal::ErrorKind::HostUnavailable
+                    | cpal::ErrorKind::StreamInvalidated
+                    | cpal::ErrorKind::BackendError
+            ) && output_error_tx.try_send(error).is_ok()
+            {
+                wake();
+            }
+        };
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
                 let shared = Arc::clone(&shared);
@@ -511,7 +559,20 @@ impl AudioEngine {
             _stream: stream,
             output_sample_rate,
             output_channels,
+            output_errors,
         })
+    }
+
+    pub(crate) fn take_output_error(&self) -> Option<cpal::Error> {
+        self.output_errors.try_recv().ok()
+    }
+
+    pub(crate) fn suspend_playback(&self) -> PlaybackState {
+        self.with_shared(|shared| std::mem::take(&mut shared.playback))
+    }
+
+    pub(crate) fn restore_playback(&self, playback: PlaybackState) {
+        self.with_shared(|shared| shared.playback = playback);
     }
 
     pub fn output_sample_rate(&self) -> u32 {
@@ -526,7 +587,14 @@ impl AudioEngine {
     /// on a background thread — the waveform is computed from the audio the engine
     /// is already playing rather than from a second copy of the track.
     pub fn load(&self, track: Arc<PlaybackBuffer>) {
-        self.with_shared(|shared| shared.playback.load(track));
+        let previous = self.with_shared(|shared| {
+            let previous = shared.playback.track.take();
+            shared.playback.load(track);
+            previous
+        });
+        // Releasing a long set can take time. Let the audio callback run
+        // while the old allocation is freed.
+        drop(previous);
     }
 
     pub fn toggle_playback(&self) {
@@ -554,7 +622,7 @@ impl AudioEngine {
     }
 
     pub fn snapshot(&self) -> PlaybackSnapshot {
-        self.with_shared(|shared| shared.snapshot())
+        self.with_shared(|shared| shared.playback.snapshot())
     }
 
     /// Drain the visualization tap into `out` (reused to avoid per-frame
@@ -591,20 +659,31 @@ fn fill_output_f32(output: &mut [f32], shared: &Arc<Mutex<EngineShared>>) {
 }
 
 fn fill_output_i16(output: &mut [i16], shared: &Arc<Mutex<EngineShared>>) {
-    let mut temp = vec![0.0_f32; output.len()];
-    fill_output_f32(&mut temp, shared);
-    for (out, sample) in output.iter_mut().zip(temp.iter()) {
-        *out = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-    }
+    fill_output_converted(output, shared, |sample| (sample * i16::MAX as f32) as i16);
 }
 
 fn fill_output_u16(output: &mut [u16], shared: &Arc<Mutex<EngineShared>>) {
-    let mut temp = vec![0.0_f32; output.len()];
-    fill_output_f32(&mut temp, shared);
-    for (out, sample) in output.iter_mut().zip(temp.iter()) {
-        let normalized = sample.clamp(-1.0, 1.0) * 0.5 + 0.5;
-        *out = (normalized * u16::MAX as f32) as u16;
+    fill_output_converted(output, shared, |sample| {
+        let normalized = sample * 0.5 + 0.5;
+        (normalized * u16::MAX as f32).round() as u16
+    });
+}
+
+fn fill_output_converted<T>(
+    output: &mut [T],
+    shared: &Arc<Mutex<EngineShared>>,
+    convert: impl Fn(f32) -> T,
+) {
+    let mut engine = shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut scratch = std::mem::take(&mut engine.conversion_scratch);
+    scratch.resize(output.len(), 0.0);
+    engine.write_output(&mut scratch);
+    for (out, &sample) in output.iter_mut().zip(&scratch) {
+        *out = convert(sample);
     }
+    engine.conversion_scratch = scratch;
 }
 
 /// Takes the buffer by value so the common case — a device whose layout already
@@ -635,16 +714,90 @@ pub fn remix_channels(
                 .sum();
             remixed.push(sum / input_channels as f32);
         } else if input_channels == 1 {
-            remixed.extend(std::iter::repeat_n(samples[input_offset], output_channels));
+            let sample = samples[input_offset];
+            remixed.extend([sample, sample]);
+            remixed.extend(std::iter::repeat_n(0.0, output_channels - 2));
         } else {
-            for channel in 0..output_channels {
-                let source_channel = channel.min(input_channels - 1);
-                remixed.push(samples[input_offset + source_channel]);
-            }
+            let copied = input_channels.min(output_channels);
+            remixed.extend_from_slice(&samples[input_offset..input_offset + copied]);
+            remixed.extend(std::iter::repeat_n(0.0, output_channels - copied));
         }
     }
 
     remixed
+}
+
+pub(crate) fn remix_track_channels(
+    samples: Vec<f32>,
+    input_channels: usize,
+    layout: Option<&Channels>,
+    output_channels: usize,
+) -> Vec<f32> {
+    if output_channels != 2 || input_channels <= 2 {
+        return remix_channels(samples, input_channels, output_channels);
+    }
+
+    let mut weights: Vec<_> = match layout {
+        Some(Channels::Positioned(positions)) => positions.iter().map(stereo_weights).collect(),
+        Some(Channels::Custom(labels)) => labels
+            .iter()
+            .map(|label| match label {
+                ChannelLabel::Positioned(position) => stereo_weights(*position),
+                _ => [0.5, 0.5],
+            })
+            .collect(),
+        _ => return remix_channels(samples, input_channels, output_channels),
+    };
+    if weights.len() != input_channels {
+        return remix_channels(samples, input_channels, output_channels);
+    }
+    // Scale both sides together to preserve stereo balance and leave headroom
+    // when several input channels peak at the same time.
+    let left_sum: f32 = weights.iter().map(|weight| weight[0]).sum();
+    let right_sum: f32 = weights.iter().map(|weight| weight[1]).sum();
+    let scale = left_sum.max(right_sum).max(1.0).recip();
+    for [left, right] in &mut weights {
+        *left *= scale;
+        *right *= scale;
+    }
+    samples
+        .chunks_exact(input_channels)
+        .flat_map(|frame| {
+            let mut stereo = [0.0; 2];
+            for (&sample, &[left, right]) in frame.iter().zip(&weights) {
+                stereo[0] += sample * left;
+                stereo[1] += sample * right;
+            }
+            stereo
+        })
+        .collect()
+}
+
+fn stereo_weights(position: Position) -> [f32; 2] {
+    use std::f32::consts::FRAC_1_SQRT_2 as MIX;
+
+    match position {
+        Position::FRONT_LEFT => [1.0, 0.0],
+        Position::FRONT_RIGHT => [0.0, 1.0],
+        Position::LFE1 | Position::LFE2 => [0.0, 0.0],
+        Position::REAR_LEFT
+        | Position::SIDE_LEFT
+        | Position::FRONT_LEFT_CENTER
+        | Position::TOP_FRONT_LEFT
+        | Position::TOP_REAR_LEFT
+        | Position::TOP_SIDE_LEFT
+        | Position::BOTTOM_FRONT_LEFT
+        | Position::FRONT_LEFT_WIDE => [MIX, 0.0],
+        Position::REAR_RIGHT
+        | Position::SIDE_RIGHT
+        | Position::FRONT_RIGHT_CENTER
+        | Position::TOP_FRONT_RIGHT
+        | Position::TOP_REAR_RIGHT
+        | Position::TOP_SIDE_RIGHT
+        | Position::BOTTOM_FRONT_RIGHT
+        | Position::FRONT_RIGHT_WIDE => [0.0, MIX],
+        _ => [MIX, MIX],
+    }
 }
 
 /// Takes the buffer by value so a device already running at the file's rate
@@ -676,24 +829,53 @@ pub fn resample_interleaved(
         .map_err(|error| AudioProcessError::Resample(error.to_string()))?;
 
     let chunk_size = input_frames.clamp(16, 4096);
-    let mut resampler = Fft::<f32>::new(
+    let mut resampler = Fft::<f32>::new_custom(
         input_rate as usize,
         output_rate as usize,
         chunk_size,
         2,
         channels,
+        WindowFunction::BlackmanHarris2,
         FixedSync::Both,
     )
     .map_err(|error| AudioProcessError::Resample(error.to_string()))?;
 
-    let output_frames_needed = resampler.process_all_needed_output_len(input_frames);
-    let mut output = vec![0.0_f32; output_frames_needed * channels];
-    let mut output_adapter = InterleavedSlice::new_mut(&mut output, channels, output_frames_needed)
-        .map_err(|error| AudioProcessError::Resample(error.to_string()))?;
-    let (_, output_frames) = resampler
-        .process_all_into_buffer(&input_adapter, &mut output_adapter, input_frames, None)
-        .map_err(|error| AudioProcessError::Resample(error.to_string()))?;
+    resampler
+        .process_all(&input_adapter, input_frames, None)
+        .map(|output| output.take_data())
+        .map_err(|error| AudioProcessError::Resample(error.to_string()))
+}
 
-    output.truncate(output_frames * channels);
-    Ok(output)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_output_rate_preserves_position_and_playing_state() {
+        let mut playback = PlaybackState::default();
+        playback.load(Arc::new(PlaybackBuffer::new(vec![0.0; 44_100], 44_100, 1)));
+        playback.set_cursor_frame(11_025);
+        playback.set_volume(0.4);
+        playback.play();
+
+        playback.replace_buffer(Arc::new(PlaybackBuffer::new(vec![0.0; 96_000], 48_000, 2)));
+
+        assert_eq!(playback.cursor_frame(), 12_000);
+        assert_eq!(playback.transport(), TransportState::Playing);
+        assert_eq!(playback.volume(), 0.4);
+    }
+
+    #[test]
+    fn changing_output_keeps_a_paused_track_at_its_end() {
+        let mut playback = PlaybackState::default();
+        playback.load(Arc::new(PlaybackBuffer::new(vec![0.0; 3], 44_100, 1)));
+        playback.play();
+        playback.pause();
+        playback.set_cursor_frame(3);
+
+        playback.replace_buffer(Arc::new(PlaybackBuffer::new(vec![0.0; 4], 48_000, 1)));
+
+        assert_eq!(playback.cursor_frame(), 4);
+        assert_eq!(playback.transport(), TransportState::Paused);
+    }
 }

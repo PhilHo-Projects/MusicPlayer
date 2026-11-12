@@ -15,9 +15,11 @@ env:
 
 jobs:
   check:
-    # Windows: this is a Windows desktop app (cpal/WASAPI), so test and build on
-    # the target platform.
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -33,10 +35,23 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --all
+        run: cargo test --all --locked
 
       - name: Build (release)
-        run: cargo build --release
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        run: pwsh -File scripts/package.ps1
+
+      - name: Smoke test the packaged MP3 launch
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $package = Get-Item dist/MusicPlayer-*.zip
+          pwsh -File scripts/smoke-windows.ps1 -PackagePath $package.FullName

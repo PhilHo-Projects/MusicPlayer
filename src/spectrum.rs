@@ -25,9 +25,9 @@ pub const BAR_COUNT: usize = 192;
 pub const DB_FLOOR: f32 = -84.0;
 pub const DB_CEIL: f32 = -18.0;
 
-// Per-frame envelope (assumes ~30 fps repaint): instant attack, eased release.
-// 0.88 ≈ 55% remaining after 1 s — slow enough that bars feel "weighted."
+// Release per frame at the 30 Hz reference rate.
 const RELEASE: f32 = 0.88;
+const MIN_VISIBLE_LEVEL: f32 = 0.001;
 
 /// Visual style for the spectrum strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -77,6 +77,7 @@ const CAP_GRAVITY: f32 = 1.8;
 pub struct SpectrumAnalyzer {
     fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
+    fft_amplitude_scale: f32,
     input: Vec<f32>,
     spectrum: Vec<Complex<f32>>,
     scratch: Vec<Complex<f32>>,
@@ -97,9 +98,14 @@ impl SpectrumAnalyzer {
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let spectrum = fft.make_output_vec();
         let scratch = fft.make_scratch_vec();
+        let window = hann_window(FFT_SIZE);
+        // A bin-centered sine contributes half the coherent window gain to
+        // its positive-frequency bin.
+        let fft_amplitude_scale = 2.0 / window.iter().sum::<f32>();
         Self {
             fft,
-            window: hann_window(FFT_SIZE),
+            window,
+            fft_amplitude_scale,
             input: vec![0.0; FFT_SIZE],
             spectrum,
             scratch,
@@ -117,6 +123,10 @@ impl SpectrumAnalyzer {
 
     pub fn peaks(&self) -> &[f32] {
         &self.peaks
+    }
+
+    pub(crate) fn is_animating(&self) -> bool {
+        self.peaks.iter().any(|&peak| peak > MIN_VISIBLE_LEVEL)
     }
 
     /// Analyze the latest output samples (oldest-first; the most recent
@@ -142,34 +152,34 @@ impl SpectrumAnalyzer {
             return;
         }
 
-        let len = self.spectrum.len();
+        let release = release_multiplier(dt);
+        let range = (params.db_ceil - params.db_floor).max(1.0);
+        let sensitivity = params.sensitivity.clamp(0.25, 3.0);
         for bar in 0..BAR_COUNT {
             let (start, end) = self.edges[bar];
-            let end = end.min(len);
             let mut mag = 0.0_f32;
-            for bin in &self.spectrum[start..end.max(start)] {
+            for bin in &self.spectrum[start..end] {
                 mag = mag.max(bin.norm());
             }
             // Normalize so a full-scale tone lands near 0 dB, then map dB→height.
-            let norm = mag / (FFT_SIZE as f32 * 0.5);
+            let norm = mag * self.fft_amplitude_scale;
             let db = 20.0 * (norm + 1e-9).log10();
-            let range = (params.db_ceil - params.db_floor).max(1.0);
-            let target = (((db - params.db_floor) / range) * params.sensitivity.clamp(0.25, 3.0))
-                .clamp(0.0, 1.0);
-            self.bars[bar] = if target >= self.bars[bar] {
-                target
-            } else {
-                self.bars[bar] * RELEASE
-            };
+            let target = (((db - params.db_floor) / range) * sensitivity).clamp(0.0, 1.0);
+            self.bars[bar] = target.max(self.bars[bar] * release);
             self.update_cap(bar, dt);
         }
     }
 
     /// Ease everything toward zero when nothing is playing (no FFT needed).
     pub fn decay(&mut self, dt: f32) {
+        let release = release_multiplier(dt);
         for bar in 0..BAR_COUNT {
-            self.bars[bar] *= RELEASE;
+            self.bars[bar] *= release;
             self.update_cap(bar, dt);
+            if self.peaks[bar] <= MIN_VISIBLE_LEVEL {
+                self.bars[bar] = 0.0;
+                self.peaks[bar] = 0.0;
+            }
         }
     }
 
@@ -188,6 +198,10 @@ impl SpectrumAnalyzer {
             self.peaks[bar] = (self.peaks[bar] - self.cap_vel[bar] * dt).max(self.bars[bar]);
         }
     }
+}
+
+fn release_multiplier(dt: f32) -> f32 {
+    RELEASE.powf(dt.max(0.0) * 30.0)
 }
 
 fn hann_window(n: usize) -> Vec<f32> {
@@ -209,13 +223,15 @@ fn compute_edges(sample_rate: f32) -> Vec<(usize, usize)> {
     let f_max = (sample_rate * 0.5).min(18_000.0).max(f_min * 2.0);
 
     let mut edges = Vec::with_capacity(BAR_COUNT);
-    let mut prev = ((f_min / bin_hz).floor() as usize).clamp(1, max_bin);
-    for bar in 0..BAR_COUNT {
-        let frac = (bar + 1) as f32 / BAR_COUNT as f32;
-        let freq = f_min * (f_max / f_min).powf(frac);
-        let end = ((freq / bin_hz).round() as usize).clamp(prev + 1, max_bin + 1);
-        edges.push((prev, end));
-        prev = end.min(max_bin);
+    let step = (f_max / f_min).powf(1.0 / BAR_COUNT as f32);
+    let mut lower = f_min;
+    for _ in 0..BAR_COUNT {
+        let upper = lower * step;
+        let start = ((lower / bin_hz).round() as usize).clamp(1, max_bin);
+        let end = ((upper / bin_hz).round() as usize).clamp(start + 1, max_bin + 1);
+        // Neighboring bass bands can share a bin at this FFT resolution.
+        edges.push((start, end));
+        lower = upper;
     }
     edges
 }

@@ -18,10 +18,13 @@ $env:RUSTFLAGS = "-C target-feature=+crt-static"
 
 $version = (Select-String -Path "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
+if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+    throw "Release tag $env:GITHUB_REF_NAME does not match Cargo version v$version"
+}
 $dist = Join-Path $root "dist\v$version"
 
 Write-Host "Building release (static CRT)..." -ForegroundColor Cyan
-cargo build --release
+cargo build --release --locked
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
