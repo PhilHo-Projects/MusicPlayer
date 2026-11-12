@@ -36,11 +36,12 @@ You can also drag-and-drop a file onto the window, or use **Open**.
 cargo test                     # unit + integration tests
 ```
 
-On Windows, run the packaged file-open smoke test from a desktop session:
+Run the packaged file-open smoke test from a Windows desktop session with
+OpenGL 2.0 or later. Add `-VerifyPlayback` to check playback with an audio device.
 
 ```powershell
 pwsh -File scripts/package.ps1
-pwsh -File scripts/smoke-windows.ps1 -PackagePath dist/MusicPlayer-v1.1.0.zip -VerifyPlayback
+pwsh -File scripts/smoke-windows.ps1 -PackagePath dist/MusicPlayer-v1.1.0.zip
 ```
 
 ## Architecture

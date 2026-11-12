@@ -11,8 +11,9 @@ is analyzed in Traktor. See `README.md` for the feature list.
 
 - GitHub: <https://github.com/PhilHo-Projects/MusicPlayer.git> (org `PhilHo-Projects`).
 - `.github/workflows/ci.yml` runs fmt, Clippy, locked tests and locked release
-  builds on Windows and macOS. Windows also checks MP3 startup and forwarding
-  with the standalone ZIP.
+  builds on Windows and macOS. The Windows job produces the standalone ZIP.
+  Run `scripts/smoke-windows.ps1` on a Windows desktop with OpenGL 2.0 or later
+  to check packaged MP3 startup and forwarding.
 - `.github/workflows/release.yml` — on a `vX.Y.Z` tag, builds the standalone
   **Windows** exe (`scripts\package.ps1`) and a universal **macOS** `.app`
   (unsigned) and attaches both to a GitHub Release. To cut a release: bump

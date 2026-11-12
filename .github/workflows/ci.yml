@@ -47,11 +47,3 @@ jobs:
       - name: Package Windows release
         if: runner.os == 'Windows'
         run: pwsh -File scripts/package.ps1
-
-      - name: Smoke test the packaged MP3 launch
-        if: runner.os == 'Windows'
-        timeout-minutes: 3
-        shell: pwsh
-        run: |
-          $package = Get-Item dist/MusicPlayer-*.zip
-          pwsh -File scripts/smoke-windows.ps1 -PackagePath $package.FullName
