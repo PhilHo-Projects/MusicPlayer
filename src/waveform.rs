@@ -119,7 +119,7 @@ impl WaveformAnalysis {
 /// One-pass biquad filter at `f0`, or `None` if the coefficients are invalid for
 /// this sample rate.
 fn band_filter(filter_type: Type<f32>, sample_rate: f32, f0: f32) -> Option<DirectForm1<f32>> {
-    let f0 = f0.clamp(20.0, sample_rate * 0.45);
+    let f0 = f0.min(sample_rate * 0.45);
     Coefficients::<f32>::from_params(filter_type, sample_rate.hz(), f0.hz(), Q_BUTTERWORTH_F32)
         .ok()
         .map(DirectForm1::<f32>::new)
@@ -127,29 +127,39 @@ fn band_filter(filter_type: Type<f32>, sample_rate: f32, f0: f32) -> Option<Dire
 
 /// Build the full per-bin analysis: peak, RMS, and low/mid/high band energies.
 /// The band split runs three biquads continuously over a mono mixdown and
-/// accumulates RMS per bin — done once on the load thread.
+/// accumulates RMS per bin. Peak and RMS share bin boundaries, and RMS uses
+/// each channel's power so stereo phase cannot erase the amplitude envelope.
 pub fn analyze_waveform(
     samples: &[f32],
     channels: usize,
     sample_rate: u32,
     bin_count: usize,
 ) -> WaveformAnalysis {
-    let peak = build_waveform(samples, channels, bin_count);
-    if peak.is_empty() || channels == 0 {
-        return WaveformAnalysis::default();
+    analyze_waveform_cancelable(samples, channels, sample_rate, bin_count, || false)
+        .unwrap_or_default()
+}
+
+pub(crate) fn analyze_waveform_cancelable(
+    samples: &[f32],
+    channels: usize,
+    sample_rate: u32,
+    bin_count: usize,
+    canceled: impl Fn() -> bool,
+) -> Option<WaveformAnalysis> {
+    if samples.is_empty() || channels == 0 || bin_count == 0 {
+        return Some(WaveformAnalysis::default());
     }
 
-    let bins = peak.len();
     let frame_count = samples.len() / channels;
     if frame_count == 0 {
-        let zeros = vec![0.0; bins];
-        return WaveformAnalysis {
-            peak,
+        let zeros = vec![0.0; bin_count];
+        return Some(WaveformAnalysis {
+            peak: zeros.clone(),
             rms: zeros.clone(),
             low: zeros.clone(),
             mid: zeros.clone(),
             high: zeros,
-        };
+        });
     }
 
     let fs = sample_rate.max(1) as f32;
@@ -157,55 +167,70 @@ pub fn analyze_waveform(
     let mut mid = band_filter(Type::BandPass, fs, 900.0);
     let mut high = band_filter(Type::HighPass, fs, 4000.0);
 
-    let mut acc_rms = vec![0.0_f64; bins];
-    let mut acc_low = vec![0.0_f64; bins];
-    let mut acc_mid = vec![0.0_f64; bins];
-    let mut acc_high = vec![0.0_f64; bins];
-    let mut counts = vec![0_u32; bins];
-
-    for frame in 0..frame_count {
-        let offset = frame * channels;
-        let mut mono = 0.0_f32;
-        for channel in 0..channels {
-            mono += samples[offset + channel];
-        }
-        mono /= channels as f32;
-
-        let bin = (frame * bins / frame_count).min(bins - 1);
-        acc_rms[bin] += (mono * mono) as f64;
-        if let Some(filter) = low.as_mut() {
-            let value = filter.run(mono);
-            acc_low[bin] += (value * value) as f64;
-        }
-        if let Some(filter) = mid.as_mut() {
-            let value = filter.run(mono);
-            acc_mid[bin] += (value * value) as f64;
-        }
-        if let Some(filter) = high.as_mut() {
-            let value = filter.run(mono);
-            acc_high[bin] += (value * value) as f64;
-        }
-        counts[bin] += 1;
-    }
-
-    let finish = |acc: &[f64]| -> Vec<f32> {
-        acc.iter()
-            .zip(&counts)
-            .map(|(sum, &count)| {
-                if count == 0 {
-                    0.0
-                } else {
-                    ((sum / count as f64).sqrt() as f32).clamp(0.0, 1.0)
-                }
-            })
-            .collect()
+    let bins = bin_count.min(frame_count);
+    let mut analysis = WaveformAnalysis {
+        peak: Vec::with_capacity(bins),
+        rms: Vec::with_capacity(bins),
+        low: Vec::with_capacity(bins),
+        mid: Vec::with_capacity(bins),
+        high: Vec::with_capacity(bins),
     };
+    let rms = |power: f64, count: usize| ((power / count as f64).sqrt() as f32).clamp(0.0, 1.0);
+    for bin in 0..bins {
+        if canceled() {
+            return None;
+        }
+        let start = bin * frame_count / bins;
+        let end = (bin + 1) * frame_count / bins;
+        let mut peak = 0.0_f32;
+        let mut power = 0.0_f64;
+        let mut low_power = 0.0_f64;
+        let mut mid_power = 0.0_f64;
+        let mut high_power = 0.0_f64;
+        for frame in samples[start * channels..end * channels].chunks_exact(channels) {
+            let mut mono = 0.0_f32;
+            for &sample in frame {
+                peak = peak.max(sample.abs());
+                power += f64::from(sample * sample);
+                mono += sample;
+            }
+            mono /= channels as f32;
 
-    WaveformAnalysis {
-        peak,
-        rms: finish(&acc_rms),
-        low: finish(&acc_low),
-        mid: finish(&acc_mid),
-        high: finish(&acc_high),
+            if let Some(filter) = &mut low {
+                let value = filter.run(mono);
+                low_power += f64::from(value * value);
+            }
+            if let Some(filter) = &mut mid {
+                let value = filter.run(mono);
+                mid_power += f64::from(value * value);
+            }
+            if let Some(filter) = &mut high {
+                let value = filter.run(mono);
+                high_power += f64::from(value * value);
+            }
+        }
+        let frames = end - start;
+        analysis.peak.push(peak.clamp(0.0, 1.0));
+        analysis.rms.push(rms(power, frames * channels));
+        analysis.low.push(rms(low_power, frames));
+        analysis.mid.push(rms(mid_power, frames));
+        analysis.high.push(rms(high_power, frames));
     }
+
+    if bins < bin_count {
+        // Repeat the nearest frame for sub-bin clips, after filtering each
+        // physical sample only once.
+        for values in [
+            &mut analysis.peak,
+            &mut analysis.rms,
+            &mut analysis.low,
+            &mut analysis.mid,
+            &mut analysis.high,
+        ] {
+            *values = (0..bin_count)
+                .map(|bin| values[bin * bins / bin_count])
+                .collect();
+        }
+    }
+    Some(analysis)
 }

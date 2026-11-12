@@ -48,3 +48,43 @@ fn tone_energy_is_localized_not_smeared() {
         bars[0]
     );
 }
+
+#[test]
+fn full_scale_midrange_tone_peaks_near_zero_db_on_the_log_axis() {
+    let mut analyzer = SpectrumAnalyzer::new(SAMPLE_RATE);
+    let freq = 46.0 * SAMPLE_RATE as f32 / FFT_SIZE as f32;
+    let params = SpectrumParams {
+        db_ceil: 0.0,
+        ..Default::default()
+    };
+    analyzer.update(&tone(freq, 1.0), &params, 1.0 / 30.0);
+
+    let (index, peak) = analyzer
+        .bars()
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .unwrap();
+    assert!(
+        (96..=112).contains(&index),
+        "1 kHz should be near the middle of a 30 Hz to 18 kHz log axis"
+    );
+    assert!(peak > 0.99, "the Hann window's gain should be compensated");
+}
+
+#[test]
+fn bar_release_depends_on_elapsed_time() {
+    let mut a = SpectrumAnalyzer::new(SAMPLE_RATE);
+    let mut b = SpectrumAnalyzer::new(SAMPLE_RATE);
+    let signal = tone(1_000.0, 1.0);
+    a.update(&signal, &SpectrumParams::default(), 1.0 / 30.0);
+    b.update(&signal, &SpectrumParams::default(), 1.0 / 30.0);
+
+    a.decay(0.1);
+    for _ in 0..3 {
+        b.decay(0.1 / 3.0);
+    }
+
+    assert!((max_bar(&a) - max_bar(&b)).abs() < 1e-6);
+}

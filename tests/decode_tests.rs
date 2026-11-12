@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::Cursor, path::Path};
 
 use music_player::{
     audio::PlaybackBuffer,
@@ -130,6 +130,59 @@ fn untagged_metadata_uses_filename_and_audio_properties() {
     assert_eq!(info.channels, Some(2));
     assert!(info.duration.unwrap().as_secs_f32() > 0.0);
     assert!(info.cover_art.is_none());
+}
+
+#[test]
+fn embedded_cover_is_resized_or_skipped_without_losing_audio() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("embedded artwork.mp3");
+
+    write_tagged_mp3(&path, b"APIC", &picture_frame(1600, 800));
+    let cover = read_track_info(&path).unwrap().cover_art.unwrap();
+    assert_eq!((cover.width, cover.height), (1024, 512));
+
+    write_tagged_mp3(&path, b"APIC", &picture_frame(65_535, 4));
+    assert!(read_track_info(&path).unwrap().cover_art.is_none());
+    assert!(!decode_track_unanalyzed(&path).unwrap().samples.is_empty());
+}
+
+#[test]
+fn traktor_detection_requires_the_private_frame_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("traktor.mp3");
+
+    write_tagged_mp3(&path, b"TIT2", b"\0TRAKTOR Bootleg");
+    let info = read_track_info(&path).unwrap();
+    assert_eq!(info.title, "TRAKTOR Bootleg");
+    assert!(!info.traktor_analyzed);
+
+    write_tagged_mp3(&path, b"PRIV", b"another-owner\0TRAKTOR4");
+    assert!(!read_track_info(&path).unwrap().traktor_analyzed);
+
+    write_tagged_mp3(&path, b"PRIV", b"TRAKTOR4\0analysis payload");
+    assert!(read_track_info(&path).unwrap().traktor_analyzed);
+}
+
+fn picture_frame(width: u32, height: u32) -> Vec<u8> {
+    let mut frame = Cursor::new(b"\0image/png\0\x03\0".to_vec());
+    frame.set_position(frame.get_ref().len() as u64);
+    let picture = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 128, 128, 255]));
+    picture
+        .write_to(&mut frame, image::ImageFormat::Png)
+        .unwrap();
+    frame.into_inner()
+}
+
+fn write_tagged_mp3(path: &Path, frame_id: &[u8; 4], payload: &[u8]) {
+    let tag_size = (10 + payload.len()) as u32;
+    let mut bytes = b"ID3\x03\0\0".to_vec();
+    bytes.extend([21, 14, 7, 0].map(|shift| ((tag_size >> shift) & 0x7f) as u8));
+    bytes.extend(frame_id);
+    bytes.extend((payload.len() as u32).to_be_bytes());
+    bytes.extend([0, 0]);
+    bytes.extend(payload);
+    bytes.extend(silent_l3_frame().repeat(30));
+    fs::write(path, bytes).unwrap();
 }
 
 #[test]

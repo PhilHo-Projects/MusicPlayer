@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::path::PathBuf;
+
 use eframe::egui;
 use music_player::app::{MusicPlayerApp, initial_file_from_args};
 use music_player::icon::app_icon;
@@ -10,9 +12,9 @@ fn main() -> eframe::Result<()> {
 
     // If a window is already open, hand it our file and exit — double-clicking a
     // track reuses the running player instead of opening another window.
-    let listener = match single_instance::acquire(initial_file.as_deref()) {
+    let file_requests = match single_instance::acquire(initial_file.as_deref()) {
         Startup::Secondary => return Ok(()),
-        Startup::Primary(listener) => listener,
+        Startup::Primary(file_requests) => file_requests,
     };
 
     let options = eframe::NativeOptions {
@@ -24,6 +26,9 @@ fn main() -> eframe::Result<()> {
         // `MusicPlayerApp::save`); the window keeps opening at its default size
         // rather than restoring last session's geometry.
         persist_window: false,
+        persistence_path: std::env::var_os("MUSICPLAYER_SETTINGS_PATH")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute()),
         ..Default::default()
     };
 
@@ -31,12 +36,8 @@ fn main() -> eframe::Result<()> {
         "MusicPlayer",
         options,
         Box::new(move |cc| {
-            let file_rx = single_instance::serve(listener, cc.egui_ctx.clone());
-            Ok(Box::new(MusicPlayerApp::new(
-                cc,
-                initial_file,
-                Some(file_rx),
-            )))
+            let file_rx = file_requests.map(|requests| requests.attach(cc.egui_ctx.clone()));
+            Ok(Box::new(MusicPlayerApp::new(cc, initial_file, file_rx)))
         }),
     )
 }

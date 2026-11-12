@@ -1,17 +1,21 @@
 use std::{
     borrow::Cow,
-    fs::File,
-    io::Read,
+    io::Cursor,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use image::ImageReader;
 use lofty::{
     file::{AudioFile, TaggedFileExt},
+    id3::v2::{Frame, Id3v2Tag},
     prelude::Accessor,
     probe::Probe,
-    tag::ItemKey,
+    tag::{ItemKey, TagType},
 };
+
+const MAX_COVER_INPUT_SIDE: u32 = 8192;
+const MAX_COVER_TEXTURE_SIDE: u32 = 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoverArt {
@@ -82,7 +86,22 @@ pub enum MetadataError {
 }
 
 pub fn read_track_info(path: &Path) -> Result<TrackInfo, MetadataError> {
-    let tagged_file = Probe::open(path)
+    let mut info = read_track_tags(path)?;
+    let missing_audio_properties = info.duration.is_none_or(|duration| duration.is_zero())
+        || info.sample_rate.is_none()
+        || info.channels.is_none();
+    if missing_audio_properties && let Ok(decoded) = crate::decoder::decode_track_unanalyzed(path) {
+        info.duration = Some(decoded.duration);
+        info.sample_rate = Some(decoded.sample_rate);
+        info.channels = Some(decoded.channels as u16);
+    }
+    Ok(info)
+}
+
+/// The player already has the properties from decoding, so it can skip the
+/// decode fallback used by callers of `read_track_info`.
+pub(crate) fn read_track_tags(path: &Path) -> Result<TrackInfo, MetadataError> {
+    let mut tagged_file = Probe::open(path)
         .map_err(|error| MetadataError::Read {
             path: path.to_path_buf(),
             message: error.to_string(),
@@ -121,16 +140,7 @@ pub fn read_track_info(path: &Path) -> Result<TrackInfo, MetadataError> {
         info.cover_art = tag
             .pictures()
             .first()
-            .and_then(|picture| image::load_from_memory(picture.data()).ok())
-            .map(|image| {
-                let rgba = image.to_rgba8();
-                let (width, height) = rgba.dimensions();
-                CoverArt {
-                    rgba: rgba.into_raw(),
-                    width,
-                    height,
-                }
-            });
+            .and_then(|picture| decode_cover(picture.data()));
 
         let bpm = tag
             .get_string(ItemKey::IntegerBpm)
@@ -139,17 +149,12 @@ pub fn read_track_info(path: &Path) -> Result<TrackInfo, MetadataError> {
         info.key = owned_non_empty(tag.get_string(ItemKey::InitialKey).map(Cow::Borrowed));
     }
 
-    info.traktor_analyzed = detect_traktor(path);
-
-    let missing_audio_properties = (info.duration.is_none()
-        || info.duration == Some(Duration::ZERO))
-        || info.sample_rate.is_none()
-        || info.channels.is_none();
-    if missing_audio_properties && let Ok(decoded) = crate::decoder::decode_track(path) {
-        info.duration = Some(decoded.duration);
-        info.sample_rate = Some(decoded.sample_rate);
-        info.channels = Some(decoded.channels as u16);
-    }
+    // Lofty retains private frames in the generic ID3v2 tag's companion data.
+    info.traktor_analyzed = tagged_file.remove(TagType::Id3v2).is_some_and(|tag| {
+        Id3v2Tag::from(tag)
+            .into_iter()
+            .any(|frame| matches!(frame, Frame::Private(frame) if frame.owner == "TRAKTOR4"))
+    });
 
     Ok(info)
 }
@@ -160,42 +165,26 @@ fn owned_non_empty(value: Option<Cow<'_, str>>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// Traktor writes its analysis (beatgrid, cue points, gain) into a `PRIV` ID3
-/// frame whose owner identifier is `TRAKTOR4`. Presence of that signature is our
-/// reliable "this was analyzed by Traktor" gate.
-fn detect_traktor(path: &Path) -> bool {
-    read_id3v2_tag(path).is_some_and(|bytes| contains(&bytes, b"TRAKTOR"))
-}
-
-/// Read just the leading ID3v2 tag (header + declared frame bytes), capped so a
-/// pathological declared size can't try to allocate the whole file. Returns
-/// `None` when there is no ID3v2 tag. Lets us sniff vendor signatures without a
-/// full tag parse.
-fn read_id3v2_tag(path: &Path) -> Option<Vec<u8>> {
-    let mut file = File::open(path).ok()?;
-    let mut header = [0u8; 10];
-    file.read_exact(&mut header).ok()?;
-    if &header[0..3] != b"ID3" {
-        return None;
-    }
-    // The tag size is a 28-bit synchsafe integer in the last 4 header bytes.
-    let size = (((header[6] & 0x7f) as usize) << 21)
-        | (((header[7] & 0x7f) as usize) << 14)
-        | (((header[8] & 0x7f) as usize) << 7)
-        | ((header[9] & 0x7f) as usize);
-    let body_len = size.min(8 * 1024 * 1024);
-    let mut body = Vec::new();
-    file.take(body_len as u64).read_to_end(&mut body).ok()?;
-    let mut bytes = Vec::with_capacity(10 + body.len());
-    bytes.extend_from_slice(&header);
-    bytes.append(&mut body);
-    Some(bytes)
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack.len() >= needle.len()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+fn decode_cover(data: &[u8]) -> Option<CoverArt> {
+    let mut reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_COVER_INPUT_SIDE);
+    limits.max_image_height = Some(MAX_COVER_INPUT_SIDE);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().ok()?;
+    let image = if image.width().max(image.height()) > MAX_COVER_TEXTURE_SIDE {
+        image.thumbnail(MAX_COVER_TEXTURE_SIDE, MAX_COVER_TEXTURE_SIDE)
+    } else {
+        image
+    };
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(CoverArt {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
 }

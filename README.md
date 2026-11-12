@@ -9,6 +9,7 @@ spectrally and turns the transport into beat-accurate bar jumps.
 ## Features
 
 - **Playback** of MP3, WAV, FLAC, M4A, AAC (decode via `symphonia`, output via `cpal`).
+- **Audio-device recovery** preserves the track position and playback state when output reconnects.
 - **10-band equalizer** (biquad peaking filters), docked in a collapsible inspector.
 - **Linear volume** fader — direct gain across the full range of travel.
 - **Tweakable waveform** — switch peak ↔ RMS reduction, and adjust bar count,
@@ -35,6 +36,14 @@ You can also drag-and-drop a file onto the window, or use **Open**.
 cargo test                     # unit + integration tests
 ```
 
+Run the packaged file-open smoke test from a Windows desktop session with
+OpenGL 2.0 or later. Add `-VerifyPlayback` to check playback with an audio device.
+
+```powershell
+pwsh -File scripts/package.ps1
+pwsh -File scripts/smoke-windows.ps1 -PackagePath dist/MusicPlayer-v1.1.0.zip
+```
+
 ## Architecture
 
 | Module | Responsibility |
@@ -46,12 +55,11 @@ cargo test                     # unit + integration tests
 | `src/metadata.rs` | `lofty` tag reading, BPM/key, Traktor signature detection |
 | `src/waveform.rs` | Per-bin analysis (peak/RMS/3-band) + render parameters |
 | `src/spectrum.rs` | Real-time FFT spectrum strip (`realfft`) — cosmetic bars + peak-hold |
-| `src/single_instance.rs` | Loopback-socket guard so a second launch reuses the open window |
+| `src/single_instance.rs` | Per-user lock and verified file handoff over a system-assigned loopback port |
 
-The waveform pipeline is split in two: a **heavy analysis** baked once at decode
-(`WaveformAnalysis` — amplitude-accurate peak, RMS, and low/mid/high band
-energies), and **cheap render parameters** (`WaveformParams`) applied every frame.
-The stored analysis is never altered by the on-screen controls.
+Waveform analysis runs in the background after playback starts. The renderer
+caches the waveform columns and updates them when the track, width, or render
+settings change. The stored analysis remains amplitude-accurate.
 
 ## Stack
 

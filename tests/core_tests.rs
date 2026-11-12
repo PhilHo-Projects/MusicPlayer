@@ -5,7 +5,7 @@ use music_player::{
     audio::{EQ_BANDS_HZ, EqSettings, clamp_seek_seconds},
     decoder::is_supported_extension,
     metadata::{TrackInfo, metadata_fallback_from_path},
-    waveform::build_waveform,
+    waveform::{analyze_waveform, build_waveform},
 };
 
 #[test]
@@ -19,6 +19,30 @@ fn waveform_generation_returns_requested_normalized_bins() {
     assert!((bins[1] - 0.5).abs() < f32::EPSILON);
     assert_eq!(bins[2], 1.0);
     assert!((bins[3] - 0.25).abs() < f32::EPSILON);
+}
+
+#[test]
+fn waveform_rms_counts_both_channels_when_phase_is_opposite() {
+    let samples = [0.5, -0.5].repeat(12);
+    let waveform = analyze_waveform(&samples, 2, 44_100, 3);
+
+    assert_eq!(waveform.rms, vec![0.5; 3]);
+}
+
+#[test]
+fn peak_and_rms_use_the_same_bin_boundaries() {
+    let waveform = analyze_waveform(&[0.0, 0.0, 1.0, 0.0, 0.0], 1, 44_100, 2);
+
+    assert_eq!(waveform.peak, vec![0.0, 1.0]);
+    assert_eq!(waveform.rms, vec![0.0, (1.0_f32 / 3.0).sqrt()]);
+}
+
+#[test]
+fn short_waveforms_repeat_samples_across_all_display_bins() {
+    let waveform = analyze_waveform(&[0.25, 0.75], 1, 44_100, 5);
+
+    assert_eq!(waveform.peak, vec![0.25, 0.25, 0.25, 0.75, 0.75]);
+    assert_eq!(waveform.rms, waveform.peak);
 }
 
 #[test]
@@ -56,9 +80,7 @@ fn equalizer_settings_clamp_gain_and_reset_to_flat() {
 
 #[test]
 fn metadata_fallback_uses_file_stem_when_tags_are_missing() {
-    let info = TrackInfo::fallback(PathBuf::from(
-        r"C:\Users\Phil\Downloads\Reverse Skydiving.mp3",
-    ));
+    let info = TrackInfo::fallback(PathBuf::from("downloads").join("Reverse Skydiving.mp3"));
 
     assert_eq!(info.title, "Reverse Skydiving");
     assert_eq!(info.artist.as_deref(), None);

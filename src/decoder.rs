@@ -6,6 +6,7 @@ use std::{
 };
 
 use symphonia::core::{
+    audio::Channels,
     codecs::audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO},
     errors::Error as SymphoniaError,
     formats::probe::Hint,
@@ -26,12 +27,15 @@ pub struct DecodedTrack {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub channels: usize,
+    pub channel_layout: Option<Channels>,
     pub duration: Duration,
     pub waveform: WaveformAnalysis,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
+    #[error("File open canceled")]
+    Canceled,
     #[error("Unsupported audio format: {path}")]
     UnsupportedExtension { path: PathBuf },
     #[error("No decodable audio track found in {path}")]
@@ -63,6 +67,16 @@ pub fn is_supported_extension(extension: &str) -> bool {
 }
 
 pub fn decode_track_unanalyzed(path: &Path) -> Result<DecodedTrack, DecodeError> {
+    decode_track_cancelable(path, || false)
+}
+
+pub(crate) fn decode_track_cancelable(
+    path: &Path,
+    canceled: impl Fn() -> bool,
+) -> Result<DecodedTrack, DecodeError> {
+    if canceled() {
+        return Err(DecodeError::Canceled);
+    }
     let extension = path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -113,8 +127,8 @@ pub fn decode_track_unanalyzed(path: &Path) -> Result<DecodedTrack, DecodeError>
             path: path.to_path_buf(),
         })?;
     let sample_rate = codec_params.sample_rate.unwrap_or(44_100);
-    let channels = codec_params
-        .channels
+    let channel_layout = codec_params.channels.clone();
+    let channels = channel_layout
         .as_ref()
         .map(|channels| channels.count())
         .unwrap_or(2);
@@ -141,6 +155,9 @@ pub fn decode_track_unanalyzed(path: &Path) -> Result<DecodedTrack, DecodeError>
     let mut packet_samples = Vec::new();
 
     loop {
+        if canceled() {
+            return Err(DecodeError::Canceled);
+        }
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
@@ -188,6 +205,7 @@ pub fn decode_track_unanalyzed(path: &Path) -> Result<DecodedTrack, DecodeError>
         samples,
         sample_rate,
         channels,
+        channel_layout,
         duration,
         waveform: WaveformAnalysis::default(),
     })

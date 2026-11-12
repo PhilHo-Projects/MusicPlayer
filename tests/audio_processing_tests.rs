@@ -25,6 +25,14 @@ fn remix_channels_duplicates_mono_to_stereo() {
 }
 
 #[test]
+fn stereo_on_a_surround_device_plays_only_through_the_front_pair() {
+    assert_eq!(
+        remix_channels(vec![0.25, -0.5], 2, 6),
+        vec![0.25, -0.5, 0.0, 0.0, 0.0, 0.0]
+    );
+}
+
+#[test]
 fn resample_interleaved_preserves_audio_when_rates_match() {
     let samples = vec![0.0, 0.25, -0.25, 0.5];
 
@@ -41,6 +49,22 @@ fn resample_interleaved_changes_frame_count_when_rate_changes() {
 
     let frames = resampled.len() / 2;
     assert!((47_900..=48_100).contains(&frames));
+}
+
+#[test]
+fn resampling_short_clips_preserves_the_opening_impulse() {
+    for frames in [32, 100, 440, 442, 882] {
+        let mut input = vec![0.0; frames];
+        input[0] = 1.0;
+        let output = resample_interleaved(input, 1, 44_100, 48_000).unwrap();
+        let (position, peak) = output
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+            .unwrap();
+        assert_eq!(position, 0, "opening impulse shifted for {frames} frames");
+        assert!(*peak > 0.5, "opening impulse faded for {frames} frames");
+    }
 }
 
 #[test]
@@ -84,6 +108,21 @@ fn playback_state_replaces_track_and_clamps_seek() {
     assert_eq!(state.transport(), TransportState::Stopped);
     assert_eq!(state.position_seconds(), 0.0);
     assert_eq!(state.duration(), Duration::from_secs(1));
+}
+
+#[test]
+fn play_restarts_at_eof_and_preserves_mid_track_position() {
+    let mut state = PlaybackState::default();
+    state.load(Arc::new(PlaybackBuffer::new(vec![0.0; 100], 100, 1)));
+    state.seek_seconds(1.0);
+    state.play();
+    assert_eq!(state.transport(), TransportState::Playing);
+    assert_eq!(state.cursor_frame(), 0);
+
+    state.seek_seconds(0.4);
+    state.pause();
+    state.play();
+    assert_eq!(state.cursor_frame(), 40);
 }
 
 #[test]
