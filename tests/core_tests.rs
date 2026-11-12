@@ -80,9 +80,7 @@ fn equalizer_settings_clamp_gain_and_reset_to_flat() {
 
 #[test]
 fn metadata_fallback_uses_file_stem_when_tags_are_missing() {
-    let info = TrackInfo::fallback(PathBuf::from(
-        r"C:\Users\Phil\Downloads\Reverse Skydiving.mp3",
-    ));
+    let info = TrackInfo::fallback(PathBuf::from("downloads").join("Reverse Skydiving.mp3"));
 
     assert_eq!(info.title, "Reverse Skydiving");
     assert_eq!(info.artist.as_deref(), None);
